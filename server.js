@@ -828,7 +828,8 @@ async function syncMetricsToPort2000(postId, isReel) {
         log('info', `[SYNC] Syncing metrics to PORT 2000: ${postId}`, metrics);
         
         // Sync to PORT 2000
-        const response = await fetch('http://192.168.50.123:7000/api/sync/metrics', {
+        //const response = await fetch('http://192.168.50.123:7000/api/sync/metrics', {
+        const response = await fetch('https://samir-hgr9.onrender.com/api/sync/metrics', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ postId, metrics, isReel }),
