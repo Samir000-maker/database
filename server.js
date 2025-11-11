@@ -73,10 +73,7 @@ const writeLimit = rateLimit({
 });
 
 app.use(express.json({ limit: '10mb' }));
-app.use(cors({
-    origin: NODE_ENV === 'production' ? ['https://yourdomain.com'] : true,
-    credentials: true
-}));
+app.use(cors());
 app.use(express.static(path.join(__dirname, 'public')));
 
 // Shutdown check middleware
