@@ -401,10 +401,6 @@ const asyncBroadcast = () => {
     });
 };
 
-// Basic endpoints
-app.get('/ping', (req, res) => {
-    res.json({ status: 'pong', timestamp: new Date().toISOString() });
-});
 
 
 
