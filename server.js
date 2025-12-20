@@ -32,12 +32,15 @@ const ENABLE_AUTO_SYNC = true; // Set to false to disable auto-sync
 // Periodic full sync (runs every 5 minutes)
 let syncIntervalId = null;
 let isSyncingLikes = false;
+let likeSyncIntervalId = null; // ADD THIS LINE
+
 
 let client = null;
 let db = null;
 let server = null;
 const sseClients = new Set();
 let isShuttingDown = false;
+
 
 // Logging utility (safe wrapper)
 const log = (level, msg, ...args) => {
