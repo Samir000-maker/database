@@ -785,10 +785,11 @@ app.post('/api/posts/increment-view', writeLimit, async (req, res) => {
         return res.status(500).json({ error: 'Failed to increment view count' });
     }
 });
+const PORT_2000_URL = process.env.PORT_2000_URL || 'https://samir-hgr9.onrender.com';
 
-
-// Helper function to sync metrics to PORT 2000
-async function syncMetricsToPort2000(postId, isReel) {
+async function syncMetricsToPort2000(postId, isReel, retryCount = 0) {
+    const MAX_RETRIES = 3;
+    
     try {
         const arrayField = isReel ? 'reelsList' : 'postList';
         
@@ -815,26 +816,119 @@ async function syncMetricsToPort2000(postId, isReel) {
             retention: content.retention || 0
         };
         
-        log('info', `[SYNC] Syncing metrics to PORT 2000: ${postId}`, metrics);
+        log('info', `[SYNC-ATTEMPT ${retryCount + 1}] ${postId}:`, metrics);
         
-        // Sync to PORT 2000
-        //const response = await fetch('http://192.168.50.123:7000/api/sync/metrics', {
-        const response = await fetch('https://samir-hgr9.onrender.com/api/sync/metrics', {
+        // Sync to PORT 2000 with timeout
+        const controller = new AbortController();
+        const timeoutId = setTimeout(() => controller.abort(), 10000); // 10s timeout
+        
+        const response = await fetch(`${PORT_2000_URL}/api/sync/metrics`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ postId, metrics, isReel }),
-            signal: AbortSignal.timeout(5000) // 5 second timeout
+            body: JSON.stringify({ 
+                postId, 
+                metrics, 
+                isReel,
+                sourceServer: 'PORT_4000',
+                timestamp: new Date().toISOString()
+            }),
+            signal: controller.signal
         });
+        
+        clearTimeout(timeoutId);
         
         if (!response.ok) {
             const errorText = await response.text();
-            log('error', `[SYNC-FAILED] ${postId}:`, errorText);
-        } else {
-            const result = await response.json();
-            log('info', `[SYNC-SUCCESS] ${postId}:`, result);
+            throw new Error(`HTTP ${response.status}: ${errorText}`);
         }
+        
+        const result = await response.json();
+        log('info', `[SYNC-SUCCESS] ${postId}:`, result);
+        
+        return result;
+        
     } catch (error) {
-        log('error', `[SYNC-ERROR] ${postId}:`, error.message);
+        log('error', `[SYNC-ERROR-RETRY-${retryCount}] ${postId}:`, error.message);
+        
+        // Retry logic
+        if (retryCount < MAX_RETRIES) {
+            const delay = Math.pow(2, retryCount) * 1000; // Exponential backoff
+            log('info', `[SYNC-RETRY] Waiting ${delay}ms before retry ${retryCount + 1}...`);
+            
+            await new Promise(resolve => setTimeout(resolve, delay));
+            return syncMetricsToPort2000(postId, isReel, retryCount + 1);
+        }
+        
+        log('error', `[SYNC-FAILED-FINAL] ${postId} after ${MAX_RETRIES} retries`);
+        return null;
+    }
+}
+
+// Periodic full sync (runs every 5 minutes)
+let syncIntervalId = null;
+
+async function periodicFullSync() {
+    try {
+        log('info', '[PERIODIC-SYNC] Starting full database sync...');
+        
+        const allSlots = await db.collection('user_slots').find({}).toArray();
+        
+        let syncedPosts = 0;
+        let syncedReels = 0;
+        let failures = 0;
+        
+        for (const slot of allSlots) {
+            // Sync posts
+            if (Array.isArray(slot.postList)) {
+                for (const post of slot.postList) {
+                    const result = await syncMetricsToPort2000(post.postId, false);
+                    if (result) syncedPosts++;
+                    else failures++;
+                    
+                    // Small delay to avoid overwhelming server
+                    await new Promise(resolve => setTimeout(resolve, 100));
+                }
+            }
+            
+            // Sync reels
+            if (Array.isArray(slot.reelsList)) {
+                for (const reel of slot.reelsList) {
+                    const result = await syncMetricsToPort2000(reel.postId, true);
+                    if (result) syncedReels++;
+                    else failures++;
+                    
+                    await new Promise(resolve => setTimeout(resolve, 100));
+                }
+            }
+        }
+        
+        log('info', `[PERIODIC-SYNC-COMPLETE] Posts: ${syncedPosts}, Reels: ${syncedReels}, Failures: ${failures}`);
+        
+    } catch (error) {
+        log('error', '[PERIODIC-SYNC-ERROR]', error.message);
+    }
+}
+
+// Start periodic sync on server startup (after MongoDB init)
+function startPeriodicSync() {
+    // Initial sync after 30 seconds
+    setTimeout(() => {
+        periodicFullSync();
+    }, 30000);
+    
+    // Then sync every 5 minutes
+    syncIntervalId = setInterval(() => {
+        periodicFullSync();
+    }, 5 * 60 * 1000);
+    
+    log('info', '[PERIODIC-SYNC] Started (every 5 minutes)');
+}
+
+// Stop periodic sync on shutdown
+function stopPeriodicSync() {
+    if (syncIntervalId) {
+        clearInterval(syncIntervalId);
+        log('info', '[PERIODIC-SYNC] Stopped');
     }
 }
 
@@ -2342,6 +2436,8 @@ process.on('unhandledRejection', (reason, promise) => {
 async function startServer() {
     try {
         await initMongo();
+        
+        startPeriodicSync();
 
         server = app.listen(PORT, HOST, () => {
             log('info', `🚀 Server listening on http://${HOST}:${PORT}/`);
