@@ -613,11 +613,15 @@ app.post('/api/posts/toggle-like', writeLimit, async (req, res) => {
 
         if (!existingSlot) {
             log('warn', `Post not found in any user slots: ${postId}`);
+            
+            // Even in fallback, return proper structure
+            const fallbackLikeCount = await db.collection('post_likes').countDocuments({ postId });
+            
             return res.json({
                 success: true,
                 action,
                 isLiked: !currentlyLiked,
-                likeCount: currentlyLiked ? 0 : 1,
+                likeCount: currentlyLiked ? Math.max(0, fallbackLikeCount - 1) : fallbackLikeCount + 1,
                 message: `Post not found in database, using fallback behavior`,
                 fallback: true
             });
@@ -644,13 +648,14 @@ app.post('/api/posts/toggle-like', writeLimit, async (req, res) => {
 
         const hasLiked = !!existingLike;
 
-        // State correction
+        // State correction - ALWAYS return current like count
         if (currentlyLiked && !hasLiked) {
+            const currentLikeCount = await db.collection('post_likes').countDocuments({ postId });
             return res.json({ 
                 success: true, 
                 message: 'State corrected', 
                 isLiked: false, 
-                likeCount: 0,
+                likeCount: currentLikeCount,
                 action: 'unlike'
             });
         }
@@ -674,7 +679,7 @@ app.post('/api/posts/toggle-like', writeLimit, async (req, res) => {
                 createdAt: new Date().toISOString()
             });
             
-            // Get current likedBy array size
+            // Get current likedBy array size from the post
             const post = existingSlot[arrayField].find(p => p.postId === postId);
             const currentLikedBy = post?.likedBy || [];
             
@@ -709,7 +714,7 @@ app.post('/api/posts/toggle-like', writeLimit, async (req, res) => {
             );
         }
 
-        // Get accurate like count from separate collection
+        // ✅ CRITICAL: Get accurate like count from separate collection
         const newLikeCount = await db.collection('post_likes').countDocuments({ postId });
 
         log('info', `Like ${action} successful: ${cleanUserId} -> ${postId}, new count: ${newLikeCount}`);
@@ -1096,7 +1101,7 @@ app.get('/api/posts/check-liked/:userId/:postId', async (req, res) => {
 
         log('debug', `[CHECK-LIKED] ${userId} -> ${postId}`);
 
-        // Check in separate likes collection (O(1) with index)
+        // ✅ Check in separate likes collection (O(1) with index)
         const existingLike = await db.collection('post_likes').findOne({
             postId: postId,
             userId: userId
@@ -2356,7 +2361,7 @@ app.get('/api/posts/get-like-count/:postId', async (req, res) => {
 
 
 
-// Batch check multiple posts' like states for a user
+// Replace the existing batch-check-liked endpoint
 app.post('/api/posts/batch-check-liked', async (req, res) => {
     try {
         const { userId, postIds } = req.body;
@@ -2367,19 +2372,25 @@ app.post('/api/posts/batch-check-liked', async (req, res) => {
 
         log('debug', `[BATCH-CHECK-LIKED] ${userId} checking ${postIds.length} posts`);
 
+        const cleanUserId = validate.sanitize(userId);
+        
+        // ✅ Query the separate post_likes collection
         const likes = await db.collection('post_likes')
             .find({ 
                 postId: { $in: postIds },
-                userId: userId 
+                userId: cleanUserId 
             })
             .project({ postId: 1 })
             .toArray();
 
         const likedPostIds = new Set(likes.map(like => like.postId));
         
+        // Build result matching the expected format
         const result = {};
         postIds.forEach(postId => {
-            result[postId] = likedPostIds.has(postId);
+            result[postId] = {
+                isLiked: likedPostIds.has(postId)
+            };
         });
 
         return res.json({
