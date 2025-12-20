@@ -2374,7 +2374,7 @@ app.post('/api/posts/batch-check-liked', async (req, res) => {
 
         const cleanUserId = validate.sanitize(userId);
         
-        // ✅ Query the separate post_likes collection
+        // Query the separate post_likes collection
         const likes = await db.collection('post_likes')
             .find({ 
                 postId: { $in: postIds },
@@ -2385,13 +2385,15 @@ app.post('/api/posts/batch-check-liked', async (req, res) => {
 
         const likedPostIds = new Set(likes.map(like => like.postId));
         
-        // Build result matching the expected format
+        // ✅ CRITICAL: Build result matching expected format
         const result = {};
         postIds.forEach(postId => {
             result[postId] = {
-                isLiked: likedPostIds.has(postId)
+                isLiked: likedPostIds.has(postId)  // ✅ Must be boolean
             };
         });
+
+        log('info', `[BATCH-CHECK-LIKED] Returning ${postIds.length} results, ${likes.length} liked`);
 
         return res.json({
             success: true,
