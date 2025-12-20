@@ -3083,7 +3083,6 @@ async function startServer() {
         startPeriodicSync();
         // startPeriodicLikeSync();
         startAutoLikeSync();
-        start
 
         server = app.listen(PORT, HOST, () => {
             log('info', `🚀 Server listening on http://${HOST}:${PORT}/`);
