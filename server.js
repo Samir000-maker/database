@@ -1000,7 +1000,6 @@ app.post('/api/posts/increment-view', writeLimit, async (req, res) => {
         return res.status(500).json({ error: 'Failed to increment view count' });
     }
 });
-const PORT_2000_URL = process.env.PORT_2000_URL || 'https://samir-hgr9.onrender.com';
 
 async function syncMetricsToPort2000(postId, isReel, retryCount = 0) {
     const MAX_RETRIES = 3;
