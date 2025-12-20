@@ -23,7 +23,11 @@ const MAX_LIKED_BY_PER_POST = 1000;
 
 
 const PORT_2000_URL = process.env.PORT_2000_URL || 'https://samir-hgr9.onrender.com';
-const SYNC_INTERVAL_MS = 5 * 60 * 1000; // Sync every 5 minutes
+// const SYNC_INTERVAL_MS = 5 * 60 * 1000; // Sync every 5 minutes
+
+const SYNC_INTERVAL_MS = 3 * 1000; // Sync every 3 seconds
+
+
 const ENABLE_AUTO_SYNC = true; // Set to false to disable auto-sync
 
 
@@ -1346,6 +1350,109 @@ function stopPeriodicLikeSync() {
     }
 }
 
+///
+
+
+
+async function syncLikesToPort2000() {
+    if (isSyncingLikes) {
+        log('debug', '[SYNC-SKIP] Already syncing');
+        return;
+    }
+
+    isSyncingLikes = true;
+    const startTime = Date.now();
+
+    try {
+        log('info', '[SYNC-4000→2000] Starting automatic sync...');
+
+        // Get all likes from PORT 4000 (source of truth)
+        const port4000Likes = await db.collection('post_likes')
+            .find({})
+            .project({ userId: 1, postId: 1 })
+            .toArray();
+
+        log('info', `[SYNC-4000→2000] Sending ${port4000Likes.length} likes to PORT 2000`);
+
+        // Send to PORT 2000 with retry logic
+        const controller = new AbortController();
+        const timeoutId = setTimeout(() => controller.abort(), 30000); // 30s timeout
+
+        const response = await fetch(`${PORT_2000_URL}/api/interactions/sync-from-port4000`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ 
+                likes: port4000Likes,
+                timestamp: new Date().toISOString()
+            }),
+            signal: controller.signal
+        });
+
+        clearTimeout(timeoutId);
+
+        if (!response.ok) {
+            throw new Error(`PORT 2000 returned HTTP ${response.status}`);
+        }
+
+        const result = await response.json();
+        const duration = Date.now() - startTime;
+
+        log('info', `[SYNC-4000→2000-SUCCESS] Added: ${result.added}, Removed: ${result.removed}, Duration: ${duration}ms`);
+
+        return {
+            success: true,
+            ...result,
+            duration
+        };
+
+    } catch (error) {
+        const duration = Date.now() - startTime;
+        log('error', `[SYNC-4000→2000-ERROR] ${error.message} (after ${duration}ms)`);
+        
+        return {
+            success: false,
+            error: error.message,
+            duration
+        };
+    } finally {
+        isSyncingLikes = false;
+    }
+}
+
+/**
+ * Start automatic periodic sync (PORT 4000 → PORT 2000)
+ */
+function startAutoLikeSync() {
+    log('info', '[AUTO-SYNC] Starting automatic like sync (PORT 4000 → PORT 2000)');
+
+    // Initial sync after 30 seconds
+    setTimeout(() => {
+        syncLikesToPort2000();
+    }, 30000);
+
+    // Then sync every SYNC_INTERVAL_MS
+    likeSyncIntervalId = setInterval(() => {
+        syncLikesToPort2000();
+    }, SYNC_INTERVAL_MS);
+
+    log('info', `[AUTO-SYNC] Periodic sync enabled (every ${SYNC_INTERVAL_MS / 1000}s)`);
+}
+
+/**
+ * Stop automatic sync
+ */
+function stopAutoLikeSync() {
+    if (likeSyncIntervalId) {
+        clearInterval(likeSyncIntervalId);
+        likeSyncIntervalId = null;
+        log('info', '[AUTO-SYNC] Stopped');
+    }
+}
+
+
+
+
+////
 
 
 
@@ -2925,6 +3032,7 @@ const gracefulShutdown = async (signal) => {
         
         stopPeriodicSync();
         stopPeriodicLikeSync();
+        startAutoLikeSync();
 
         // Close server
         if (server && server.close) {
@@ -2969,7 +3077,9 @@ async function startServer() {
         await initMongo();
         
         startPeriodicSync();
-        startPeriodicLikeSync();
+        // startPeriodicLikeSync();
+        startAutoLikeSync();
+        start
 
         server = app.listen(PORT, HOST, () => {
             log('info', `🚀 Server listening on http://${HOST}:${PORT}/`);
