@@ -31,6 +31,7 @@ const SYNC_INTERVAL_MS = 3 * 1000; // Sync every 3 seconds
 const ENABLE_AUTO_SYNC = true; // Set to false to disable auto-sync
 // Periodic full sync (runs every 5 minutes)
 let syncIntervalId = null;
+let isSyncingLikes = false;
 
 let client = null;
 let db = null;
