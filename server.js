@@ -1128,7 +1128,7 @@ async function periodicFullSync() {
 
 
 
-let syncIntervalId = null;
+
 let isSyncing = false;
 
 /**
