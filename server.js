@@ -19,6 +19,8 @@ const NODE_ENV = process.env.NODE_ENV || 'development';
 
 const SLOT_CAPACITY = 250; // Changed from 2 to 6
 
+const MAX_LIKED_BY_PER_POST = 1000;
+
 let client = null;
 let db = null;
 let server = null;
@@ -632,10 +634,10 @@ app.post('/api/posts/toggle-like', writeLimit, async (req, res) => {
         const cleanUserId = validate.sanitize(userId);
         const action = currentlyLiked ? 'unlike' : 'like';
 
-        // ✅ STEP 1: Get accurate like count from post_likes collection FIRST
+        // ✅ STEP 1: Get current like count from post_likes collection
         const currentLikeCount = await db.collection('post_likes').countDocuments({ postId });
         
-        log('debug', `[LIKE-COUNT-CHECK] ${postId} has ${currentLikeCount} likes in post_likes collection`);
+        log('debug', `[LIKE-COUNT-PRE] ${postId} has ${currentLikeCount} likes`);
 
         // ✅ STEP 2: Find which array contains the post
         const existingSlot = await db.collection('user_slots').findOne({
@@ -648,7 +650,7 @@ app.post('/api/posts/toggle-like', writeLimit, async (req, res) => {
         if (!existingSlot) {
             log('warn', `[LIKE-FALLBACK] Post not found: ${postId}`);
             
-            // Still process the like in post_likes collection
+            // Still process like in post_likes collection
             const existingLike = await db.collection('post_likes').findOne({
                 postId: postId,
                 userId: cleanUserId
@@ -674,26 +676,26 @@ app.post('/api/posts/toggle-like', writeLimit, async (req, res) => {
                 action,
                 isLiked: !currentlyLiked,
                 likeCount: newLikeCount,
-                message: `Post not found in user_slots, updated post_likes only`,
+                message: `Post not found in user_slots`,
                 fallback: true
             });
         }
 
-        // ✅ STEP 3: Determine which array field
+        // ✅ STEP 3: Determine array field
         let arrayField = null;
-        let isInPostList = existingSlot.postList && existingSlot.postList.some(item => item.postId === postId);
-        let isInReelsList = existingSlot.reelsList && existingSlot.reelsList.some(item => item.postId === postId);
+        const isInPostList = existingSlot.postList && existingSlot.postList.some(item => item.postId === postId);
+        const isInReelsList = existingSlot.reelsList && existingSlot.reelsList.some(item => item.postId === postId);
 
         if (isInPostList) {
             arrayField = 'postList';
         } else if (isInReelsList) {
             arrayField = 'reelsList';
         } else {
-            log('error', `[LIKE-ERROR] Post ${postId} exists in slot but not in either array`);
-            return res.status(500).json({ error: 'Data inconsistency error' });
+            log('error', `[LIKE-ERROR] Post ${postId} not in any array`);
+            return res.status(500).json({ error: 'Data inconsistency' });
         }
 
-        // ✅ STEP 4: Check if user already liked in post_likes collection
+        // ✅ STEP 4: Check actual like state in post_likes
         const existingLike = await db.collection('post_likes').findOne({
             postId: postId,
             userId: cleanUserId
@@ -703,29 +705,29 @@ app.post('/api/posts/toggle-like', writeLimit, async (req, res) => {
 
         // ✅ STEP 5: State correction
         if (currentlyLiked && !hasLiked) {
-            const actualLikeCount = await db.collection('post_likes').countDocuments({ postId });
-            log('info', `[STATE-CORRECTION] User thinks liked but isn't - actual count: ${actualLikeCount}`);
+            const actualCount = await db.collection('post_likes').countDocuments({ postId });
+            log('info', `[STATE-CORRECT] Client thinks liked but isn't - count: ${actualCount}`);
             return res.json({ 
                 success: true, 
                 message: 'State corrected', 
                 isLiked: false, 
-                likeCount: actualLikeCount,
+                likeCount: actualCount,
                 action: 'unlike'
             });
         }
         if (!currentlyLiked && hasLiked) {
-            const actualLikeCount = await db.collection('post_likes').countDocuments({ postId });
-            log('info', `[STATE-CORRECTION] User thinks not liked but is - actual count: ${actualLikeCount}`);
+            const actualCount = await db.collection('post_likes').countDocuments({ postId });
+            log('info', `[STATE-CORRECT] Client thinks not liked but is - count: ${actualCount}`);
             return res.json({ 
                 success: true, 
                 message: 'State corrected', 
                 isLiked: true,
-                likeCount: actualLikeCount,
+                likeCount: actualCount,
                 action: 'like'
             });
         }
 
-        // ✅ STEP 6: Perform like/unlike operation in post_likes collection
+        // ✅ STEP 6: Perform like/unlike in post_likes collection
         if (!currentlyLiked) {
             // Add like
             await db.collection('post_likes').insertOne({
@@ -733,35 +735,33 @@ app.post('/api/posts/toggle-like', writeLimit, async (req, res) => {
                 userId: cleanUserId,
                 createdAt: new Date().toISOString()
             });
-            
-            log('info', `[LIKE-ADDED] ${cleanUserId} -> ${postId}`);
+            log('info', `[LIKE-ADDED] ${cleanUserId} liked ${postId}`);
         } else {
             // Remove like
             await db.collection('post_likes').deleteOne({
                 postId: postId,
                 userId: cleanUserId
             });
-            
-            log('info', `[LIKE-REMOVED] ${cleanUserId} -> ${postId}`);
+            log('info', `[LIKE-REMOVED] ${cleanUserId} unliked ${postId}`);
         }
 
-        // ✅ STEP 7: Get accurate like count from post_likes
+        // ✅ STEP 7: Get accurate count from post_likes
         const newLikeCount = await db.collection('post_likes').countDocuments({ postId });
         
-        log('info', `[LIKE-COUNT-UPDATED] ${postId} now has ${newLikeCount} likes`);
+        log('info', `[LIKE-COUNT-POST] ${postId} now has ${newLikeCount} likes`);
 
-        // ✅ STEP 8: Update user_slots with accurate count (sync from post_likes)
+        // ✅ STEP 8: Update user_slots with accurate count
         const post = existingSlot[arrayField].find(p => p.postId === postId);
         const currentLikedBy = post?.likedBy || [];
         
         let updateOperation = {
             $set: { 
-                [`${arrayField}.$.likeCount`]: newLikeCount,  // ✅ Set to accurate count
+                [`${arrayField}.$.likeCount`]: newLikeCount,
                 'updatedAt': new Date().toISOString() 
             }
         };
         
-        // Only update likedBy array if under limit
+        // Only update likedBy if under limit
         if (!currentlyLiked && currentLikedBy.length < MAX_LIKED_BY_PER_POST) {
             updateOperation.$addToSet = { [`${arrayField}.$.likedBy`]: cleanUserId };
         } else if (currentlyLiked) {
@@ -773,12 +773,12 @@ app.post('/api/posts/toggle-like', writeLimit, async (req, res) => {
             updateOperation
         );
 
-        log('info', `[LIKE-SUCCESS] ${action}: ${cleanUserId} -> ${postId}, new count: ${newLikeCount}`);
+        log('info', `[LIKE-SUCCESS] ${action}: ${cleanUserId} -> ${postId}, count: ${newLikeCount}`);
 
         // Sync to PORT 2000
         const isReelContent = arrayField === 'reelsList';
         syncMetricsToPort2000(postId, isReelContent).catch(err => {
-            log('error', '[LIKE-SYNC-ERROR]', err.message);
+            log('error', '[SYNC-ERROR]', err.message);
         });
 
         asyncBroadcast();
@@ -793,10 +793,10 @@ app.post('/api/posts/toggle-like', writeLimit, async (req, res) => {
         });
 
     } catch (error) {
-        log('error', '[LIKE-TOGGLE-ERROR]', error && error.message ? error.message : error);
+        log('error', '[TOGGLE-LIKE-ERROR]', error.message, error.stack);
         res.status(500).json({ 
             error: 'Internal server error',
-            details: error && error.message ? error.message : 'Unknown error'
+            details: error.message
         });
     }
 });
@@ -1268,7 +1268,7 @@ app.get('/api/posts/check-liked/:userId/:postId', async (req, res) => {
 
         log('debug', `[CHECK-LIKED] ${userId} -> ${postId}`);
 
-        // ✅ Check in separate likes collection (O(1) with index)
+        // Check in post_likes collection
         const existingLike = await db.collection('post_likes').findOne({
             postId: postId,
             userId: userId
@@ -1280,13 +1280,12 @@ app.get('/api/posts/check-liked/:userId/:postId', async (req, res) => {
             success: true,
             isLiked,
             postId,
-            userId,
-            queryTime: Date.now()
+            userId
         });
 
     } catch (error) {
         log('error', '[CHECK-LIKED-ERROR]', error);
-        return res.status(500).json({ error: 'Failed to check like state' });
+        return res.status(500).json({ error: 'Failed to check like' });
     }
 });
 
@@ -2505,12 +2504,12 @@ app.get('/api/posts/get-like-count/:postId', async (req, res) => {
             return res.status(400).json({ error: 'postId required' });
         }
 
-        log('debug', `[GET-LIKE-COUNT] Fetching for ${postId}`);
+        log('debug', `[GET-COUNT] ${postId}`);
 
-        // ✅ Get accurate count from post_likes collection (source of truth)
+        // Get count from post_likes collection (source of truth)
         const likeCount = await db.collection('post_likes').countDocuments({ postId });
 
-        log('info', `[GET-LIKE-COUNT] ${postId} -> ${likeCount}`);
+        log('info', `[GET-COUNT] ${postId} -> ${likeCount}`);
 
         return res.json({
             success: true,
@@ -2520,8 +2519,8 @@ app.get('/api/posts/get-like-count/:postId', async (req, res) => {
         });
 
     } catch (error) {
-        log('error', '[GET-LIKE-COUNT-ERROR]', error);
-        return res.status(500).json({ error: 'Failed to get like count' });
+        log('error', '[GET-COUNT-ERROR]', error);
+        return res.status(500).json({ error: 'Failed to get count' });
     }
 });
 
@@ -2536,11 +2535,11 @@ app.post('/api/posts/batch-check-liked', async (req, res) => {
             return res.status(400).json({ error: 'userId and postIds array required' });
         }
 
-        log('debug', `[BATCH-CHECK-LIKED] ${userId} checking ${postIds.length} posts`);
+        log('debug', `[BATCH-CHECK] ${userId} checking ${postIds.length} posts`);
 
         const cleanUserId = validate.sanitize(userId);
         
-        // Query the separate post_likes collection
+        // Query post_likes collection
         const likes = await db.collection('post_likes')
             .find({ 
                 postId: { $in: postIds },
@@ -2551,15 +2550,15 @@ app.post('/api/posts/batch-check-liked', async (req, res) => {
 
         const likedPostIds = new Set(likes.map(like => like.postId));
         
-        // ✅ CRITICAL: Build result matching expected format
+        // Build result
         const result = {};
         postIds.forEach(postId => {
             result[postId] = {
-                isLiked: likedPostIds.has(postId)  // ✅ Must be boolean
+                isLiked: likedPostIds.has(postId)
             };
         });
 
-        log('info', `[BATCH-CHECK-LIKED] Returning ${postIds.length} results, ${likes.length} liked`);
+        log('info', `[BATCH-CHECK] ${postIds.length} posts, ${likes.length} liked`);
 
         return res.json({
             success: true,
@@ -2568,8 +2567,8 @@ app.post('/api/posts/batch-check-liked', async (req, res) => {
         });
 
     } catch (error) {
-        log('error', '[BATCH-CHECK-LIKED-ERROR]', error);
-        return res.status(500).json({ error: 'Failed to batch check likes' });
+        log('error', '[BATCH-CHECK-ERROR]', error);
+        return res.status(500).json({ error: 'Failed to check likes' });
     }
 });
 
