@@ -3080,9 +3080,9 @@ async function startServer() {
     try {
         await initMongo();
         
-        startPeriodicSync();
+        // startPeriodicSync();
         // startPeriodicLikeSync();
-        startAutoLikeSync();
+        // startAutoLikeSync();
 
         server = app.listen(PORT, HOST, () => {
             log('info', `🚀 Server listening on http://${HOST}:${PORT}/`);
