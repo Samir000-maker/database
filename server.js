@@ -32,6 +32,9 @@ const ENABLE_AUTO_SYNC = true; // Set to false to disable auto-sync
 let isSyncingLikes = false;
 let likeSyncIntervalId = null; // ADD THIS LINE
 
+let isSyncing = false;
+let syncIntervalId = null;
+
 
 let client = null;
 let db = null;
