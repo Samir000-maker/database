@@ -138,6 +138,25 @@ async function initMongo() {
     }
 
 
+// Inside initMongo() function, add:
+const postLikesIndexes = [
+    { 
+        collection: 'post_likes', 
+        index: { postId: 1, userId: 1 }, 
+        options: { unique: true, background: true } 
+    },
+    { 
+        collection: 'post_likes', 
+        index: { postId: 1 }, 
+        options: { background: true } 
+    },
+    { 
+        collection: 'post_likes', 
+        index: { userId: 1 }, 
+        options: { background: true } 
+    }
+];
+
 for (const { collection, index, options } of postLikesIndexes) {
     try {
         await db.collection(collection).createIndex(index, options);
@@ -146,34 +165,6 @@ for (const { collection, index, options } of postLikesIndexes) {
         log('warn', `Index error for ${collection}: ${e.message}`);
     }
 }
-    
-    
-    const likesIndexes = [
-        { 
-            collection: 'post_likes', 
-            index: { postId: 1, userId: 1 }, 
-            options: { unique: true, background: true } 
-        },
-        { 
-            collection: 'post_likes', 
-            index: { postId: 1 }, 
-            options: { background: true } 
-        },
-        { 
-            collection: 'post_likes', 
-            index: { userId: 1 }, 
-            options: { background: true } 
-        }
-    ];
-
-    for (const { collection, index, options } of likesIndexes) {
-        try {
-            await db.collection(collection).createIndex(index, options);
-            log('info', `Created likes index for ${collection}`);
-        } catch (e) {
-            log('warn', `Likes index error for ${collection}: ${e.message}`);
-        }
-    }
     
     
     
