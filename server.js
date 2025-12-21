@@ -29,8 +29,6 @@ const SYNC_INTERVAL_MS = 5 * 60 * 1000; // Sync every 5 minutes
 
 
 const ENABLE_AUTO_SYNC = true; // Set to false to disable auto-sync
-// Periodic full sync (runs every 5 minutes)
-let syncIntervalId = null;
 let isSyncingLikes = false;
 let likeSyncIntervalId = null; // ADD THIS LINE
 
@@ -140,25 +138,6 @@ async function initMongo() {
     }
 
 
-// Inside initMongo() function, add:
-const postLikesIndexes = [
-    { 
-        collection: 'post_likes', 
-        index: { postId: 1, userId: 1 }, 
-        options: { unique: true, background: true } 
-    },
-    { 
-        collection: 'post_likes', 
-        index: { postId: 1 }, 
-        options: { background: true } 
-    },
-    { 
-        collection: 'post_likes', 
-        index: { userId: 1 }, 
-        options: { background: true } 
-    }
-];
-
 for (const { collection, index, options } of postLikesIndexes) {
     try {
         await db.collection(collection).createIndex(index, options);
@@ -196,27 +175,6 @@ for (const { collection, index, options } of postLikesIndexes) {
         }
     }
     
-       const likeCheckIndexes = [
-        { 
-            collection: 'user_slots', 
-            index: { 'postList.postId': 1, 'postList.likedBy': 1 }, 
-            options: { background: true } 
-        },
-        { 
-            collection: 'user_slots', 
-            index: { 'reelsList.postId': 1, 'reelsList.likedBy': 1 }, 
-            options: { background: true } 
-        }
-    ];
-
-    for (const { collection, index, options } of likeCheckIndexes) {
-        try {
-            await db.collection(collection).createIndex(index, options);
-            log('info', `Created like-check index for ${collection}`);
-        } catch (e) {
-            log('warn', `Like-check index error for ${collection}: ${e.message}`);
-        }
-    }
     
     
     await setupCommentIndexes();
@@ -817,113 +775,6 @@ app.post('/api/posts/toggle-like', writeLimit, async (req, res) => {
 });
 
 
-//optional remove it
-
-// Add this endpoint to fix existing data
-app.post('/api/admin/fix-like-counts', async (req, res) => {
-    try {
-        const { adminKey } = req.body;
-        
-        // Simple auth
-        if (adminKey !== process.env.ADMIN_KEY && adminKey !== 'fix-likes-now') {
-            return res.status(403).json({ error: 'Unauthorized' });
-        }
-
-        log('info', '[FIX-LIKES] Starting like count correction...');
-
-        let fixedPosts = 0;
-        let fixedReels = 0;
-        let errors = 0;
-
-        const allSlots = await db.collection('user_slots').find({}).toArray();
-
-        for (const slot of allSlots) {
-            // Fix posts
-            if (Array.isArray(slot.postList)) {
-                for (let i = 0; i < slot.postList.length; i++) {
-                    const post = slot.postList[i];
-                    try {
-                        // Get accurate count from post_likes
-                        const actualLikeCount = await db.collection('post_likes')
-                            .countDocuments({ postId: post.postId });
-
-                        // Update if different or negative
-                        if (post.likeCount !== actualLikeCount || post.likeCount < 0) {
-                            await db.collection('user_slots').updateOne(
-                                { 
-                                    _id: slot._id,
-                                    'postList.postId': post.postId 
-                                },
-                                { 
-                                    $set: { 
-                                        'postList.$.likeCount': actualLikeCount,
-                                        'updatedAt': new Date().toISOString()
-                                    } 
-                                }
-                            );
-                            
-                            log('info', `[FIX] Post ${post.postId}: ${post.likeCount} -> ${actualLikeCount}`);
-                            fixedPosts++;
-                        }
-                    } catch (error) {
-                        log('error', `[FIX-ERROR] Post ${post.postId}:`, error.message);
-                        errors++;
-                    }
-                }
-            }
-
-            // Fix reels
-            if (Array.isArray(slot.reelsList)) {
-                for (let i = 0; i < slot.reelsList.length; i++) {
-                    const reel = slot.reelsList[i];
-                    try {
-                        // Get accurate count from post_likes
-                        const actualLikeCount = await db.collection('post_likes')
-                            .countDocuments({ postId: reel.postId });
-
-                        // Update if different or negative
-                        if (reel.likeCount !== actualLikeCount || reel.likeCount < 0) {
-                            await db.collection('user_slots').updateOne(
-                                { 
-                                    _id: slot._id,
-                                    'reelsList.postId': reel.postId 
-                                },
-                                { 
-                                    $set: { 
-                                        'reelsList.$.likeCount': actualLikeCount,
-                                        'updatedAt': new Date().toISOString()
-                                    } 
-                                }
-                            );
-                            
-                            log('info', `[FIX] Reel ${reel.postId}: ${reel.likeCount} -> ${actualLikeCount}`);
-                            fixedReels++;
-                        }
-                    } catch (error) {
-                        log('error', `[FIX-ERROR] Reel ${reel.postId}:`, error.message);
-                        errors++;
-                    }
-                }
-            }
-        }
-
-        log('info', `[FIX-COMPLETE] Fixed ${fixedPosts} posts, ${fixedReels} reels, ${errors} errors`);
-
-        res.json({
-            success: true,
-            fixedPosts,
-            fixedReels,
-            errors,
-            message: 'Like counts corrected'
-        });
-
-    } catch (error) {
-        log('error', '[FIX-LIKES-ERROR]', error);
-        res.status(500).json({ error: 'Failed to fix like counts' });
-    }
-});
-
-
 
 
 // POST increment view count (only for retention contributors)
@@ -1136,258 +987,40 @@ async function periodicFullSync() {
 
 
 
-
-let isSyncing = false;
-
-/**
- * Sync likes from PORT 2000 (contributionToLike) to PORT 4000 (post_likes)
- */
-async function syncFromPort2000ToPort4000() {
-    if (isSyncing) {
-        log('warn', '[SYNC-SKIP] Already syncing');
-        return { skipped: true };
-    }
-
-    isSyncing = true;
-    log('info', '[SYNC-2000→4000] Starting sync...');
-
-    try {
-        const startTime = Date.now();
-        let added = 0;
-        let removed = 0;
-        let errors = 0;
-
-        // Fetch all likes from PORT 2000
-        const response = await fetch(`${PORT_2000_URL}/api/interactions/export-all-likes`, {
-            method: 'GET',
-            headers: { 'Content-Type': 'application/json' },
-            signal: AbortSignal.timeout(30000) // 30s timeout
-        });
-
-        if (!response.ok) {
-            throw new Error(`PORT 2000 returned ${response.status}`);
-        }
-
-        const data = await response.json();
-        const port2000Likes = data.likes || []; // Array of {userId, postId}
-
-        log('info', `[SYNC-2000→4000] Fetched ${port2000Likes.length} likes from PORT 2000`);
-
-        // Get all likes from PORT 4000
-        const port4000Likes = await db.collection('post_likes')
-            .find({})
-            .project({ userId: 1, postId: 1, _id: 0 })
-            .toArray();
-
-        log('info', `[SYNC-2000→4000] Found ${port4000Likes.length} likes in PORT 4000`);
-
-        // Create sets for comparison
-        const port2000Set = new Set(
-            port2000Likes.map(like => `${like.userId}_${like.postId}`)
-        );
-        const port4000Set = new Set(
-            port4000Likes.map(like => `${like.userId}_${like.postId}`)
-        );
-
-        // Find likes to ADD to PORT 4000 (in 2000 but not in 4000)
-        const likesToAdd = port2000Likes.filter(like => 
-            !port4000Set.has(`${like.userId}_${like.postId}`)
-        );
-
-        // Find likes to REMOVE from PORT 4000 (in 4000 but not in 2000)
-        const likesToRemove = port4000Likes.filter(like => 
-            !port2000Set.has(`${like.userId}_${like.postId}`)
-        );
-
-        log('info', `[SYNC-2000→4000] To add: ${likesToAdd.length}, To remove: ${likesToRemove.length}`);
-
-        // ADD missing likes to PORT 4000
-        if (likesToAdd.length > 0) {
-            for (const like of likesToAdd) {
-                try {
-                    await db.collection('post_likes').insertOne({
-                        postId: like.postId,
-                        userId: like.userId,
-                        createdAt: new Date().toISOString(),
-                        syncedFrom: 'PORT_2000'
-                    });
-                    added++;
-                } catch (error) {
-                    if (error.code !== 11000) { // Ignore duplicates
-                        log('error', `[SYNC-ADD-ERROR] ${like.postId}:`, error.message);
-                        errors++;
-                    }
-                }
-            }
-        }
-
-        // REMOVE extra likes from PORT 4000
-        if (likesToRemove.length > 0) {
-            for (const like of likesToRemove) {
-                try {
-                    await db.collection('post_likes').deleteOne({
-                        postId: like.postId,
-                        userId: like.userId
-                    });
-                    removed++;
-                } catch (error) {
-                    log('error', `[SYNC-REMOVE-ERROR] ${like.postId}:`, error.message);
-                    errors++;
-                }
-            }
-        }
-
-        const duration = Date.now() - startTime;
-        log('info', `[SYNC-2000→4000-COMPLETE] Added: ${added}, Removed: ${removed}, Errors: ${errors}, Duration: ${duration}ms`);
-
-        return { added, removed, errors, duration };
-
-    } catch (error) {
-        log('error', '[SYNC-2000→4000-ERROR]', error.message);
-        return { error: error.message };
-    } finally {
-        isSyncing = false;
-    }
-}
-
-/**
- * Sync likes from PORT 4000 (post_likes) to PORT 2000 (contributionToLike)
- */
-async function syncFromPort4000ToPort2000() {
-    log('info', '[SYNC-4000→2000] Starting sync...');
-
-    try {
-        const startTime = Date.now();
-
-        // Get all likes from PORT 4000
-        const port4000Likes = await db.collection('post_likes')
-            .find({})
-            .project({ userId: 1, postId: 1 })
-            .toArray();
-
-        log('info', `[SYNC-4000→2000] Sending ${port4000Likes.length} likes to PORT 2000`);
-
-        // Send to PORT 2000 for sync
-        const response = await fetch(`${PORT_2000_URL}/api/interactions/sync-likes-from-port4000`, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ 
-                likes: port4000Likes,
-                timestamp: new Date().toISOString()
-            }),
-            signal: AbortSignal.timeout(60000) // 60s timeout
-        });
-
-        if (!response.ok) {
-            throw new Error(`PORT 2000 returned ${response.status}`);
-        }
-
-        const result = await response.json();
-        const duration = Date.now() - startTime;
-
-        log('info', `[SYNC-4000→2000-COMPLETE] Result:`, result, `Duration: ${duration}ms`);
-
-        return result;
-
-    } catch (error) {
-        log('error', '[SYNC-4000→2000-ERROR]', error.message);
-        return { error: error.message };
-    }
-}
-
-/**
- * Full bidirectional sync
- */
-async function fullBidirectionalSync() {
-    log('info', '[FULL-SYNC] Starting bidirectional sync...');
-
-    const results = {
-        timestamp: new Date().toISOString(),
-        port2000_to_4000: null,
-        port4000_to_2000: null
-    };
-
-    // Step 1: Sync from PORT 2000 to PORT 4000
-    results.port2000_to_4000 = await syncFromPort2000ToPort4000();
-
-    // Wait 2 seconds between syncs
-    await new Promise(resolve => setTimeout(resolve, 2000));
-
-    // Step 2: Sync from PORT 4000 to PORT 2000
-    results.port4000_to_2000 = await syncFromPort4000ToPort2000();
-
-    log('info', '[FULL-SYNC-COMPLETE]', results);
-
-    return results;
-}
-
-/**
- * Start periodic sync
- */
-function startPeriodicLikeSync() {
-    if (!ENABLE_AUTO_SYNC) {
-        log('info', '[SYNC] Auto-sync disabled');
-        return;
-    }
-
-    // Initial sync after 30 seconds
-    setTimeout(() => {
-        fullBidirectionalSync();
-    }, 30000);
-
-    // Then sync every SYNC_INTERVAL_MS
-    syncIntervalId = setInterval(() => {
-        fullBidirectionalSync();
-    }, SYNC_INTERVAL_MS);
-
-    log('info', `[SYNC] Periodic sync started (every ${SYNC_INTERVAL_MS / 1000}s)`);
-}
-
-/**
- * Stop periodic sync
- */
-function stopPeriodicLikeSync() {
-    if (syncIntervalId) {
-        clearInterval(syncIntervalId);
-        syncIntervalId = null;
-        log('info', '[SYNC] Periodic sync stopped');
-    }
-}
-
 ///
 
 
 
+// REPLACE THE ENTIRE FUNCTION WITH:
 async function syncLikesToPort2000() {
     if (isSyncingLikes) {
         log('debug', '[SYNC-SKIP] Already syncing');
-        return;
+        return { skipped: true };
     }
 
     isSyncingLikes = true;
     const startTime = Date.now();
 
     try {
-        log('info', '[SYNC-4000→2000] Starting automatic sync...');
+        log('info', '[EVENT-SYNC] Like change detected, syncing to PORT 2000...');
 
-        // Get all likes from PORT 4000 (source of truth)
         const port4000Likes = await db.collection('post_likes')
             .find({})
             .project({ userId: 1, postId: 1 })
             .toArray();
 
-        log('info', `[SYNC-4000→2000] Sending ${port4000Likes.length} likes to PORT 2000`);
+        log('info', `[EVENT-SYNC] Sending ${port4000Likes.length} likes`);
 
-        // Send to PORT 2000 with retry logic
         const controller = new AbortController();
-        const timeoutId = setTimeout(() => controller.abort(), 30000); // 30s timeout
+        const timeoutId = setTimeout(() => controller.abort(), 15000); // 15s timeout
 
         const response = await fetch(`${PORT_2000_URL}/api/interactions/sync-from-port4000`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ 
                 likes: port4000Likes,
-                timestamp: new Date().toISOString()
+                timestamp: new Date().toISOString(),
+                trigger: 'event-driven'
             }),
             signal: controller.signal
         });
@@ -1395,29 +1028,20 @@ async function syncLikesToPort2000() {
         clearTimeout(timeoutId);
 
         if (!response.ok) {
-            throw new Error(`PORT 2000 returned HTTP ${response.status}`);
+            throw new Error(`HTTP ${response.status}`);
         }
 
         const result = await response.json();
         const duration = Date.now() - startTime;
 
-        log('info', `[SYNC-4000→2000-SUCCESS] Added: ${result.added}, Removed: ${result.removed}, Duration: ${duration}ms`);
+        log('info', `[EVENT-SYNC-SUCCESS] ${duration}ms, changes: +${result.added} -${result.removed}`);
 
-        return {
-            success: true,
-            ...result,
-            duration
-        };
+        return { success: true, ...result, duration };
 
     } catch (error) {
         const duration = Date.now() - startTime;
-        log('error', `[SYNC-4000→2000-ERROR] ${error.message} (after ${duration}ms)`);
-        
-        return {
-            success: false,
-            error: error.message,
-            duration
-        };
+        log('error', `[EVENT-SYNC-ERROR] ${error.message} (${duration}ms)`);
+        return { success: false, error: error.message, duration };
     } finally {
         isSyncingLikes = false;
     }
@@ -1483,10 +1107,6 @@ function stopPeriodicSync() {
     }
 }
 
-
-
-
-// Manual sync trigger endpoint
 app.post('/api/admin/sync-likes', async (req, res) => {
     try {
         const { adminKey, direction } = req.body;
@@ -1520,45 +1140,6 @@ app.post('/api/admin/sync-likes', async (req, res) => {
     }
 });
 
-// Get sync status
-app.get('/api/admin/sync-status', async (req, res) => {
-    try {
-        const port4000Count = await db.collection('post_likes').countDocuments({});
-
-        // Try to get PORT 2000 count
-        let port2000Count = 'unavailable';
-        try {
-            const response = await fetch(`${PORT_2000_URL}/api/interactions/like-count`, {
-                signal: AbortSignal.timeout(5000)
-            });
-            if (response.ok) {
-                const data = await response.json();
-                port2000Count = data.count || 0;
-            }
-        } catch (error) {
-            log('warn', '[SYNC-STATUS] Could not reach PORT 2000');
-        }
-
-        res.json({
-            success: true,
-            port4000: {
-                collection: 'post_likes',
-                count: port4000Count
-            },
-            port2000: {
-                collection: 'contributionToLike',
-                count: port2000Count
-            },
-            syncEnabled: ENABLE_AUTO_SYNC,
-            syncInterval: SYNC_INTERVAL_MS,
-            isSyncing
-        });
-
-    } catch (error) {
-        log('error', '[SYNC-STATUS-ERROR]', error);
-        res.status(500).json({ error: 'Failed to get status' });
-    }
-});
 
 
 
@@ -1630,46 +1211,6 @@ app.post('/api/posts/check-view-contributions', async (req, res) => {
     } catch (error) {
         log('error', '[BATCH-VIEW-CHECK-ERROR]', error);
         return res.status(500).json({ error: 'Failed to check view contributions' });
-    }
-});
-
-
-
-// Add this debug endpoint to your MongoDB server
-app.get('/api/posts/debug-exists/:postId', async (req, res) => {
-    try {
-        const { postId } = req.params;
-        
-        const existingSlot = await db.collection('user_slots').findOne({
-            $or: [
-                { 'reelsList.postId': postId },
-                { 'postList.postId': postId }
-            ]
-        });
-
-        let foundDetails = null;
-        if (existingSlot) {
-            const inPostList = existingSlot.postList && existingSlot.postList.some(item => item.postId === postId);
-            const inReelsList = existingSlot.reelsList && existingSlot.reelsList.some(item => item.postId === postId);
-            
-            foundDetails = {
-                slotId: existingSlot._id,
-                userId: existingSlot.userId,
-                inPostList,
-                inReelsList,
-                arrayField: inPostList ? 'postList' : (inReelsList ? 'reelsList' : 'unknown')
-            };
-        }
-
-        res.json({
-            exists: !!existingSlot,
-            postId,
-            details: foundDetails
-        });
-        
-    } catch (error) {
-        log('error', 'Debug check failed:', error);
-        res.status(500).json({ error: 'Debug check failed' });
     }
 });
 
@@ -3035,8 +2576,6 @@ const gracefulShutdown = async (signal) => {
         sseClients.clear();
         
         stopPeriodicSync();
-        stopPeriodicLikeSync();
-        startAutoLikeSync();
 
         // Close server
         if (server && server.close) {
@@ -3080,9 +2619,9 @@ async function startServer() {
     try {
         await initMongo();
         
-        // startPeriodicSync();
+        startPeriodicSync();
         // startPeriodicLikeSync();
-        // startAutoLikeSync();
+        startAutoLikeSync();
 
         server = app.listen(PORT, HOST, () => {
             log('info', `🚀 Server listening on http://${HOST}:${PORT}/`);
