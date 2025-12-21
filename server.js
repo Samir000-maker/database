@@ -855,10 +855,31 @@ app.post('/api/posts/increment-view', writeLimit, async (req, res) => {
     }
 });
 
+// Track ongoing syncs to prevent duplicates
+const ongoingSyncs = new Map();
+const recentlySynced = new Map();
+
 async function syncMetricsToPort2000(postId, isReel, retryCount = 0) {
     const MAX_RETRIES = 3;
+    const SYNC_COOLDOWN = 5000; // 5 seconds cooldown between syncs for same postId
     
     try {
+        // Check if already syncing this postId
+        if (ongoingSyncs.has(postId)) {
+            log('info', `[SYNC-SKIP] ${postId} sync already in progress`);
+            return { success: true, skipped: true, reason: 'already_syncing' };
+        }
+        
+        // Check if recently synced (within cooldown period)
+        const lastSyncTime = recentlySynced.get(postId);
+        if (lastSyncTime && (Date.now() - lastSyncTime) < SYNC_COOLDOWN) {
+            log('info', `[SYNC-SKIP] ${postId} synced ${Date.now() - lastSyncTime}ms ago (cooldown: ${SYNC_COOLDOWN}ms)`);
+            return { success: true, skipped: true, reason: 'recently_synced' };
+        }
+        
+        // Mark as syncing
+        ongoingSyncs.set(postId, Date.now());
+        
         const arrayField = isReel ? 'reelsList' : 'postList';
         
         // Get current metrics from PORT 4000
@@ -868,13 +889,15 @@ async function syncMetricsToPort2000(postId, isReel, retryCount = 0) {
         
         if (!slot) {
             log('warn', `[SYNC] Post not found for sync: ${postId}`);
-            return;
+            ongoingSyncs.delete(postId);
+            return null;
         }
         
         const content = slot[arrayField]?.find(item => item.postId === postId);
         if (!content) {
             log('warn', `[SYNC] Content not found in array: ${postId}`);
-            return;
+            ongoingSyncs.delete(postId);
+            return null;
         }
         
         const metrics = {
@@ -913,15 +936,24 @@ async function syncMetricsToPort2000(postId, isReel, retryCount = 0) {
         const result = await response.json();
         log('info', `[SYNC-SUCCESS] ${postId}:`, result);
         
+        // Mark as successfully synced
+        recentlySynced.set(postId, Date.now());
+        
+        // Clean up old entries from recentlySynced (older than 1 minute)
+        cleanupRecentlySynced();
+        
         return result;
         
     } catch (error) {
         log('error', `[SYNC-ERROR-RETRY-${retryCount}] ${postId}:`, error.message);
         
-        // Retry logic
-        if (retryCount < MAX_RETRIES) {
-            const delay = Math.pow(2, retryCount) * 1000; // Exponential backoff
+        // Retry logic - only for network errors, not for duplicate prevention
+        if (retryCount < MAX_RETRIES && error.name !== 'AbortError') {
+            const delay = Math.pow(2, retryCount) * 1000; // Exponential backoff: 1s, 2s, 4s
             log('info', `[SYNC-RETRY] Waiting ${delay}ms before retry ${retryCount + 1}...`);
+            
+            // Remove from ongoing syncs before retry
+            ongoingSyncs.delete(postId);
             
             await new Promise(resolve => setTimeout(resolve, delay));
             return syncMetricsToPort2000(postId, isReel, retryCount + 1);
@@ -929,8 +961,27 @@ async function syncMetricsToPort2000(postId, isReel, retryCount = 0) {
         
         log('error', `[SYNC-FAILED-FINAL] ${postId} after ${MAX_RETRIES} retries`);
         return null;
+        
+    } finally {
+        // Always remove from ongoing syncs after completion/failure
+        ongoingSyncs.delete(postId);
     }
 }
+
+// Cleanup function to prevent memory leaks
+function cleanupRecentlySynced() {
+    const now = Date.now();
+    const ONE_MINUTE = 60000;
+    
+    for (const [postId, timestamp] of recentlySynced.entries()) {
+        if (now - timestamp > ONE_MINUTE) {
+            recentlySynced.delete(postId);
+        }
+    }
+}
+
+// Optional: Periodic cleanup every 2 minutes
+setInterval(cleanupRecentlySynced, 120000);
 
 
 
