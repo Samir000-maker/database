@@ -23,9 +23,9 @@ const MAX_LIKED_BY_PER_POST = 1000;
 
 
 const PORT_2000_URL = process.env.PORT_2000_URL || 'https://samir-hgr9.onrender.com';
-// const SYNC_INTERVAL_MS = 5 * 60 * 1000; // Sync every 5 minutes
+const SYNC_INTERVAL_MS = 5 * 60 * 1000; // Sync every 5 minutes
 
-const SYNC_INTERVAL_MS = 3 * 1000; // Sync every 3 seconds
+// const SYNC_INTERVAL_MS = 3 * 1000; // Sync every 3 seconds
 
 
 const ENABLE_AUTO_SYNC = true; // Set to false to disable auto-sync
