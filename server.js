@@ -139,6 +139,38 @@ async function initMongo() {
         log('error', 'MongoDB initialization failed:', error && error.message ? error.message : error);
         throw error;
     }
+    
+    
+    
+    
+    // Inside initMongo() function, add after post_likes indexes:
+const postRetentionIndexes = [
+    { 
+        collection: 'post_retention', 
+        index: { postId: 1, userId: 1 }, 
+        options: { unique: true, background: true } 
+    },
+    { 
+        collection: 'post_retention', 
+        index: { postId: 1 }, 
+        options: { background: true } 
+    },
+    { 
+        collection: 'post_retention', 
+        index: { userId: 1 }, 
+        options: { background: true } 
+    }
+];
+
+for (const { collection, index, options } of postRetentionIndexes) {
+    try {
+        await db.collection(collection).createIndex(index, options);
+        log('info', `Created index for ${collection}`);
+    } catch (e) {
+        log('warn', `Index error for ${collection}: ${e.message}`);
+    }
+}
+    
 
 
 // Inside initMongo() function, add:
@@ -504,7 +536,6 @@ app.get('/ping', (req, res) => {
 
 
 // In your PORT 4000 server (document index 2)
-
 app.post('/api/posts/record-retention', writeLimit, async (req, res) => {
     try {
         const { userId, postId, retentionPercent, watchedDuration, totalDuration, isReel } = req.body;
@@ -522,17 +553,13 @@ app.post('/api/posts/record-retention', writeLimit, async (req, res) => {
         const cleanUserId = validate.sanitize(userId);
         const arrayField = isReel ? 'reelsList' : 'postList';
 
-        // ✅ CRITICAL FIX: Use $elemMatch to check THIS SPECIFIC POST's contributors
-        const existingSlot = await db.collection('user_slots').findOne({
-            [arrayField]: {
-                $elemMatch: {
-                    postId: postId,
-                    retentionContributors: cleanUserId
-                }
-            }
+        // ✅ Check if user already contributed retention using post_retention collection
+        const existingRetention = await db.collection('post_retention').findOne({
+            postId: postId,
+            userId: cleanUserId
         });
 
-        if (existingSlot) {
+        if (existingRetention) {
             log('info', `Retention duplicate blocked: ${cleanUserId} -> ${postId}`);
             return res.json({ 
                 success: true, 
@@ -541,7 +568,19 @@ app.post('/api/posts/record-retention', writeLimit, async (req, res) => {
             });
         }
 
-        // ✅ Now update the retention data for THIS SPECIFIC POST
+        // ✅ Add retention record to post_retention collection
+        await db.collection('post_retention').insertOne({
+            postId: postId,
+            userId: cleanUserId,
+            retentionPercent: Math.round(retentionPercent * 100) / 100,
+            watchedDuration,
+            totalDuration,
+            createdAt: new Date().toISOString()
+        });
+
+        log('info', `Retention record added: ${cleanUserId} -> ${postId}`);
+
+        // ✅ Update the post's retention metrics in user_slots
         const updateResult = await db.collection('user_slots').updateOne(
             {
                 [`${arrayField}.postId`]: postId
@@ -553,9 +592,6 @@ app.post('/api/posts/record-retention', writeLimit, async (req, res) => {
                     [`${arrayField}.$.totalDuration`]: totalDuration,
                     [`${arrayField}.$.retentionUpdatedAt`]: new Date().toISOString(),
                     'updatedAt': new Date().toISOString()
-                },
-                $addToSet: {
-                    [`${arrayField}.$.retentionContributors`]: cleanUserId
                 }
             }
         );
@@ -601,12 +637,7 @@ app.post('/api/posts/toggle-like', writeLimit, async (req, res) => {
         const cleanUserId = validate.sanitize(userId);
         const action = currentlyLiked ? 'unlike' : 'like';
 
-        // ✅ STEP 1: Get current like count from post_likes collection
-        const currentLikeCount = await db.collection('post_likes').countDocuments({ postId });
-        
-        log('debug', `[LIKE-COUNT-PRE] ${postId} has ${currentLikeCount} likes`);
-
-        // ✅ STEP 2: Find which array contains the post
+        // ✅ Find which array contains the post
         const existingSlot = await db.collection('user_slots').findOne({
             $or: [
                 { 'postList.postId': postId },
@@ -648,7 +679,7 @@ app.post('/api/posts/toggle-like', writeLimit, async (req, res) => {
             });
         }
 
-        // ✅ STEP 3: Determine array field
+        // ✅ Determine array field
         let arrayField = null;
         const isInPostList = existingSlot.postList && existingSlot.postList.some(item => item.postId === postId);
         const isInReelsList = existingSlot.reelsList && existingSlot.reelsList.some(item => item.postId === postId);
@@ -662,7 +693,7 @@ app.post('/api/posts/toggle-like', writeLimit, async (req, res) => {
             return res.status(500).json({ error: 'Data inconsistency' });
         }
 
-        // ✅ STEP 4: Check actual like state in post_likes
+        // ✅ Check actual like state in post_likes
         const existingLike = await db.collection('post_likes').findOne({
             postId: postId,
             userId: cleanUserId
@@ -670,7 +701,7 @@ app.post('/api/posts/toggle-like', writeLimit, async (req, res) => {
 
         const hasLiked = !!existingLike;
 
-        // ✅ STEP 5: State correction
+        // ✅ State correction
         if (currentlyLiked && !hasLiked) {
             const actualCount = await db.collection('post_likes').countDocuments({ postId });
             log('info', `[STATE-CORRECT] Client thinks liked but isn't - count: ${actualCount}`);
@@ -694,9 +725,8 @@ app.post('/api/posts/toggle-like', writeLimit, async (req, res) => {
             });
         }
 
-        // ✅ STEP 6: Perform like/unlike in post_likes collection
+        // ✅ Perform like/unlike in post_likes collection
         if (!currentlyLiked) {
-            // Add like
             await db.collection('post_likes').insertOne({
                 postId: postId,
                 userId: cleanUserId,
@@ -704,7 +734,6 @@ app.post('/api/posts/toggle-like', writeLimit, async (req, res) => {
             });
             log('info', `[LIKE-ADDED] ${cleanUserId} liked ${postId}`);
         } else {
-            // Remove like
             await db.collection('post_likes').deleteOne({
                 postId: postId,
                 userId: cleanUserId
@@ -712,32 +741,20 @@ app.post('/api/posts/toggle-like', writeLimit, async (req, res) => {
             log('info', `[LIKE-REMOVED] ${cleanUserId} unliked ${postId}`);
         }
 
-        // ✅ STEP 7: Get accurate count from post_likes
+        // ✅ Get accurate count from post_likes
         const newLikeCount = await db.collection('post_likes').countDocuments({ postId });
         
         log('info', `[LIKE-COUNT-POST] ${postId} now has ${newLikeCount} likes`);
 
-        // ✅ STEP 8: Update user_slots with accurate count
-        const post = existingSlot[arrayField].find(p => p.postId === postId);
-        const currentLikedBy = post?.likedBy || [];
-        
-        let updateOperation = {
-            $set: { 
-                [`${arrayField}.$.likeCount`]: newLikeCount,
-                'updatedAt': new Date().toISOString() 
-            }
-        };
-        
-        // Only update likedBy if under limit
-        if (!currentlyLiked && currentLikedBy.length < MAX_LIKED_BY_PER_POST) {
-            updateOperation.$addToSet = { [`${arrayField}.$.likedBy`]: cleanUserId };
-        } else if (currentlyLiked) {
-            updateOperation.$pull = { [`${arrayField}.$.likedBy`]: cleanUserId };
-        }
-        
+        // ✅ Update user_slots with accurate count (NO likedBy array)
         await db.collection('user_slots').updateOne(
             { [`${arrayField}.postId`]: postId },
-            updateOperation
+            {
+                $set: { 
+                    [`${arrayField}.$.likeCount`]: newLikeCount,
+                    'updatedAt': new Date().toISOString() 
+                }
+            }
         );
 
         log('info', `[LIKE-SUCCESS] ${action}: ${cleanUserId} -> ${postId}, count: ${newLikeCount}`);
@@ -785,6 +802,7 @@ app.post('/api/posts/increment-view', writeLimit, async (req, res) => {
         const cleanUserId = validate.sanitize(userId);
         const arrayField = isReel ? 'reelsList' : 'postList';
 
+        // ✅ Check if user already viewed using viewedBy array (this is fine as viewedBy is for counting)
         const existingView = await db.collection('user_slots').findOne({
             [`${arrayField}.postId`]: postId,
             [`${arrayField}.viewedBy`]: cleanUserId
@@ -799,10 +817,11 @@ app.post('/api/posts/increment-view', writeLimit, async (req, res) => {
             });
         }
 
-        const retentionCheck = await db.collection('user_slots').findOne({
-            [`${arrayField}.postId`]: postId,
-            [`${arrayField}.retentionContributors`]: cleanUserId
-        });
+        // ✅ Check if user contributed retention using post_retention collection
+        const retentionCheck = await db.collection('post_retention').findOne({
+            postId: postId,
+            userId: cleanUserId
+        }, { projection: { _id: 1 } });
 
         if (!retentionCheck) {
             log('warn', `[VIEW-NO-RETENTION] ${cleanUserId} has not contributed retention for ${postId}`);
@@ -1203,43 +1222,56 @@ app.post('/api/posts/check-view-contributions', async (req, res) => {
         const cleanUserId = validate.sanitize(userId);
         const result = {};
 
-        // Single optimized query for all posts
+        // ✅ Single optimized query to check retention contributions from post_retention collection
+        const retentionRecords = await db.collection('post_retention')
+            .find({ 
+                postId: { $in: postIds },
+                userId: cleanUserId 
+            })
+            .project({ postId: 1 })
+            .toArray();
+
+        const hasRetentionSet = new Set(retentionRecords.map(r => r.postId));
+
+        // ✅ Single optimized query to check viewedBy from user_slots
         const [postSlots, reelSlots] = await Promise.all([
             db.collection('user_slots').find({
-                'postList.postId': { $in: postIds }
-            }).project({ 'postList.$': 1 }).toArray(),
+                'postList.postId': { $in: postIds },
+                'postList.viewedBy': cleanUserId
+            }).project({ 'postList.postId': 1, 'postList.viewedBy': 1 }).toArray(),
             
             db.collection('user_slots').find({
-                'reelsList.postId': { $in: postIds }
-            }).project({ 'reelsList.$': 1 }).toArray()
+                'reelsList.postId': { $in: postIds },
+                'reelsList.viewedBy': cleanUserId
+            }).project({ 'reelsList.postId': 1, 'reelsList.viewedBy': 1 }).toArray()
         ]);
 
-        // Process results
-        for (const postId of postIds) {
-            let hasRetention = false;
-            let hasViewCounted = false;
-
-            // Check in postList
-            for (const slot of postSlots) {
-                const post = slot.postList && slot.postList[0];
-                if (post && post.postId === postId) {
-                    hasRetention = post.retentionContributors && post.retentionContributors.includes(cleanUserId);
-                    hasViewCounted = post.viewedBy && post.viewedBy.includes(cleanUserId);
-                    break;
-                }
-            }
-
-            // Check in reelsList if not found
-            if (!hasRetention && !hasViewCounted) {
-                for (const slot of reelSlots) {
-                    const reel = slot.reelsList && slot.reelsList[0];
-                    if (reel && reel.postId === postId) {
-                        hasRetention = reel.retentionContributors && reel.retentionContributors.includes(cleanUserId);
-                        hasViewCounted = reel.viewedBy && reel.viewedBy.includes(cleanUserId);
-                        break;
+        const hasViewCountedSet = new Set();
+        
+        postSlots.forEach(slot => {
+            if (slot.postList) {
+                slot.postList.forEach(post => {
+                    if (post.viewedBy && post.viewedBy.includes(cleanUserId)) {
+                        hasViewCountedSet.add(post.postId);
                     }
-                }
+                });
             }
+        });
+        
+        reelSlots.forEach(slot => {
+            if (slot.reelsList) {
+                slot.reelsList.forEach(reel => {
+                    if (reel.viewedBy && reel.viewedBy.includes(cleanUserId)) {
+                        hasViewCountedSet.add(reel.postId);
+                    }
+                });
+            }
+        });
+
+        // Build result
+        for (const postId of postIds) {
+            const hasRetention = hasRetentionSet.has(postId);
+            const hasViewCounted = hasViewCountedSet.has(postId);
 
             result[postId] = {
                 hasRetention,
