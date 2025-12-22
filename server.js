@@ -535,7 +535,6 @@ app.get('/ping', (req, res) => {
 
 
 
-// In your PORT 4000 server (document index 2)
 app.post('/api/posts/record-retention', writeLimit, async (req, res) => {
     try {
         const { userId, postId, retentionPercent, watchedDuration, totalDuration, isReel } = req.body;
@@ -580,20 +579,39 @@ app.post('/api/posts/record-retention', writeLimit, async (req, res) => {
 
         log('info', `Retention record added: ${cleanUserId} -> ${postId}`);
 
-        // ✅ Update the post's retention metrics in user_slots
+        // ✅ Check if user already viewed (has viewedBy entry)
+        const existingView = await db.collection('user_slots').findOne({
+            [`${arrayField}.postId`]: postId,
+            [`${arrayField}.viewedBy`]: cleanUserId
+        });
+
+        const shouldIncrementView = !existingView;
+
+        // ✅ Update the post's retention metrics AND increment view count if needed
+        const updateOperations = {
+            $set: {
+                [`${arrayField}.$.retention`]: Math.round(retentionPercent * 100) / 100,
+                [`${arrayField}.$.watchedDuration`]: watchedDuration,
+                [`${arrayField}.$.totalDuration`]: totalDuration,
+                [`${arrayField}.$.retentionUpdatedAt`]: new Date().toISOString(),
+                'updatedAt': new Date().toISOString()
+            }
+        };
+
+        // Add view count increment and viewedBy if not already viewed
+        if (shouldIncrementView) {
+            updateOperations.$inc = { [`${arrayField}.$.viewCount`]: 1 };
+            updateOperations.$addToSet = { [`${arrayField}.$.viewedBy`]: cleanUserId };
+            log('info', `Will increment view count for ${postId} by ${cleanUserId}`);
+        } else {
+            log('info', `User ${cleanUserId} already viewed ${postId}, skipping view increment`);
+        }
+
         const updateResult = await db.collection('user_slots').updateOne(
             {
                 [`${arrayField}.postId`]: postId
             },
-            {
-                $set: {
-                    [`${arrayField}.$.retention`]: Math.round(retentionPercent * 100) / 100,
-                    [`${arrayField}.$.watchedDuration`]: watchedDuration,
-                    [`${arrayField}.$.totalDuration`]: totalDuration,
-                    [`${arrayField}.$.retentionUpdatedAt`]: new Date().toISOString(),
-                    'updatedAt': new Date().toISOString()
-                }
-            }
+            updateOperations
         );
 
         if (updateResult.matchedCount === 0) {
@@ -601,7 +619,17 @@ app.post('/api/posts/record-retention', writeLimit, async (req, res) => {
             return res.status(404).json({ error: 'Post not found in database' });
         }
 
-        log('info', `Retention recorded successfully: ${cleanUserId} -> ${postId}, ${retentionPercent}%`);
+        // Get updated view count for response
+        const updatedSlot = await db.collection('user_slots').findOne(
+            { [`${arrayField}.postId`]: postId },
+            { projection: { [`${arrayField}.$`]: 1 } }
+        );
+
+        const viewCount = updatedSlot && updatedSlot[arrayField] && updatedSlot[arrayField][0]
+            ? Math.max(0, updatedSlot[arrayField][0].viewCount || 0)
+            : 0;
+
+        log('info', `Retention recorded successfully: ${cleanUserId} -> ${postId}, ${retentionPercent}%, viewCount: ${viewCount}, incremented: ${shouldIncrementView}`);
         
         // Sync to PORT 2000
         syncMetricsToPort2000(postId, isReel).catch(err => {
@@ -614,7 +642,9 @@ app.post('/api/posts/record-retention', writeLimit, async (req, res) => {
             success: true,
             message: 'Retention recorded successfully',
             postId,
-            retentionPercent: Math.round(retentionPercent * 100) / 100
+            retentionPercent: Math.round(retentionPercent * 100) / 100,
+            viewCount,
+            viewIncremented: shouldIncrementView
         });
 
     } catch (error) {
@@ -1207,8 +1237,6 @@ app.post('/api/admin/sync-likes', async (req, res) => {
 
 
 
-
-// Batch check view contributions
 app.post('/api/posts/check-view-contributions', async (req, res) => {
     try {
         const { userId, postIds } = req.body;
@@ -1276,7 +1304,8 @@ app.post('/api/posts/check-view-contributions', async (req, res) => {
             result[postId] = {
                 hasRetention,
                 hasViewCounted,
-                canIncrementView: hasRetention && !hasViewCounted
+                // View will be auto-incremented when retention is recorded if not already viewed
+                willAutoIncrement: hasRetention && !hasViewCounted
             };
         }
 
