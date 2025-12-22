@@ -861,23 +861,20 @@ const recentlySynced = new Map();
 
 async function syncMetricsToPort2000(postId, isReel, retryCount = 0) {
     const MAX_RETRIES = 3;
-    const SYNC_COOLDOWN = 5000; // 5 seconds cooldown between syncs for same postId
+    const SYNC_COOLDOWN = 5000;
     
     try {
-        // Check if already syncing this postId
         if (ongoingSyncs.has(postId)) {
             log('info', `[SYNC-SKIP] ${postId} sync already in progress`);
             return { success: true, skipped: true, reason: 'already_syncing' };
         }
         
-        // Check if recently synced (within cooldown period)
         const lastSyncTime = recentlySynced.get(postId);
         if (lastSyncTime && (Date.now() - lastSyncTime) < SYNC_COOLDOWN) {
             log('info', `[SYNC-SKIP] ${postId} synced ${Date.now() - lastSyncTime}ms ago (cooldown: ${SYNC_COOLDOWN}ms)`);
             return { success: true, skipped: true, reason: 'recently_synced' };
         }
         
-        // Mark as syncing
         ongoingSyncs.set(postId, Date.now());
         
         const arrayField = isReel ? 'reelsList' : 'postList';
@@ -902,16 +899,15 @@ async function syncMetricsToPort2000(postId, isReel, retryCount = 0) {
         
         const metrics = {
             likeCount: content.likeCount || 0,
-            commentCount: content.commentCount || 0,
+            commentCount: content.commentCount || 0,  // ✅ Ensure this is included
             viewCount: content.viewCount || 0,
             retention: content.retention || 0
         };
         
         log('info', `[SYNC-ATTEMPT ${retryCount + 1}] ${postId}:`, metrics);
         
-        // Sync to PORT 2000 with timeout
         const controller = new AbortController();
-        const timeoutId = setTimeout(() => controller.abort(), 10000); // 10s timeout
+        const timeoutId = setTimeout(() => controller.abort(), 10000);
         
         const response = await fetch(`${PORT_2000_URL}/api/sync/metrics`, {
             method: 'POST',
@@ -936,10 +932,7 @@ async function syncMetricsToPort2000(postId, isReel, retryCount = 0) {
         const result = await response.json();
         log('info', `[SYNC-SUCCESS] ${postId}:`, result);
         
-        // Mark as successfully synced
         recentlySynced.set(postId, Date.now());
-        
-        // Clean up old entries from recentlySynced (older than 1 minute)
         cleanupRecentlySynced();
         
         return result;
@@ -947,12 +940,10 @@ async function syncMetricsToPort2000(postId, isReel, retryCount = 0) {
     } catch (error) {
         log('error', `[SYNC-ERROR-RETRY-${retryCount}] ${postId}:`, error.message);
         
-        // Retry logic - only for network errors, not for duplicate prevention
         if (retryCount < MAX_RETRIES && error.name !== 'AbortError') {
-            const delay = Math.pow(2, retryCount) * 1000; // Exponential backoff: 1s, 2s, 4s
+            const delay = Math.pow(2, retryCount) * 1000;
             log('info', `[SYNC-RETRY] Waiting ${delay}ms before retry ${retryCount + 1}...`);
             
-            // Remove from ongoing syncs before retry
             ongoingSyncs.delete(postId);
             
             await new Promise(resolve => setTimeout(resolve, delay));
@@ -963,7 +954,6 @@ async function syncMetricsToPort2000(postId, isReel, retryCount = 0) {
         return null;
         
     } finally {
-        // Always remove from ongoing syncs after completion/failure
         ongoingSyncs.delete(postId);
     }
 }
@@ -1458,10 +1448,9 @@ app.get('/api/comments/:commentId/replies', async (req, res) => {
     }
 });
 
-// POST new comment or reply
 app.post('/api/comments', writeLimit, async (req, res) => {
     try {
-        const { postId, userId, username, profilePictureUrl, text, parentId, replyToUsername, ownerId } = req.body;
+        const { postId, userId, username, profilePictureUrl, text, parentId, replyToUsername, ownerId, isReel } = req.body;
         
         if (!postId || !userId || !username || !text) {
             return res.status(400).json({ error: 'postId, userId, username, and text required' });
@@ -1500,7 +1489,7 @@ app.post('/api/comments', writeLimit, async (req, res) => {
         }
         
         // Update post's comment count in user_slots
-        const arrayField = req.body.isReel ? 'reelsList' : 'postList';
+        const arrayField = isReel ? 'reelsList' : 'postList';
         await db.collection('user_slots').updateOne(
             { [`${arrayField}.postId`]: postId },
             { 
@@ -1508,6 +1497,13 @@ app.post('/api/comments', writeLimit, async (req, res) => {
                 $set: { updatedAt: now }
             }
         );
+        
+        log('info', `[COMMENT-ADDED] ${postId}, syncing to PORT 2000...`);
+        
+        // Sync to PORT 2000
+        syncMetricsToPort2000(postId, isReel).catch(err => {
+            log('error', '[COMMENT-SYNC-ERROR]', err.message);
+        });
         
         asyncBroadcast();
         
@@ -1560,7 +1556,6 @@ app.patch('/api/comments/:commentId', writeLimit, async (req, res) => {
     }
 });
 
-// DELETE comment/reply
 app.delete('/api/comments/:commentId', writeLimit, async (req, res) => {
     try {
         const { commentId } = req.params;
@@ -1622,6 +1617,14 @@ app.delete('/api/comments/:commentId', writeLimit, async (req, res) => {
                 $set: { updatedAt: new Date().toISOString() }
             }
         );
+        
+        log('info', `[COMMENT-DELETED] ${postId}, deleted ${totalDeleted}, syncing to PORT 2000...`);
+        
+        // Sync to PORT 2000
+        const isReelBool = isReel === 'true';
+        syncMetricsToPort2000(postId, isReelBool).catch(err => {
+            log('error', '[COMMENT-DELETE-SYNC-ERROR]', err.message);
+        });
         
         asyncBroadcast();
         
@@ -2504,6 +2507,13 @@ app.get('/api/posts/get-like-count/:postId', async (req, res) => {
         return res.status(500).json({ error: 'Failed to get count' });
     }
 });
+
+
+
+
+
+
+
 
 
 
