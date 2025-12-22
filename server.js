@@ -229,35 +229,7 @@ for (const { collection, index, options } of commentCountIndexes) {
     }
 }
     
-    
-    
-    
-    // Add after existing comment indexes setup
-const viewCountIndexes = [
-    { 
-        collection: 'user_slots', 
-        index: { 'postList.postId': 1, 'postList.viewedBy': 1 }, 
-        options: { background: true } 
-    },
-    { 
-        collection: 'user_slots', 
-        index: { 'reelsList.postId': 1, 'reelsList.viewedBy': 1 }, 
-        options: { background: true } 
-    }
-];
-
-for (const { collection, index, options } of viewCountIndexes) {
-    try {
-        await db.collection(collection).createIndex(index, options);
-        log('info', `Created view-count index for ${collection}`);
-    } catch (e) {
-        log('warn', `View-count index error for ${collection}: ${e.message}`);
-    }
-}
-    
-    
-    
-    
+  
     
 }
 
@@ -579,39 +551,21 @@ app.post('/api/posts/record-retention', writeLimit, async (req, res) => {
 
         log('info', `Retention record added: ${cleanUserId} -> ${postId}`);
 
-        // ✅ Check if user already viewed (has viewedBy entry)
-        const existingView = await db.collection('user_slots').findOne({
-            [`${arrayField}.postId`]: postId,
-            [`${arrayField}.viewedBy`]: cleanUserId
-        });
-
-        const shouldIncrementView = !existingView;
-
-        // ✅ Update the post's retention metrics AND increment view count if needed
-        const updateOperations = {
-            $set: {
-                [`${arrayField}.$.retention`]: Math.round(retentionPercent * 100) / 100,
-                [`${arrayField}.$.watchedDuration`]: watchedDuration,
-                [`${arrayField}.$.totalDuration`]: totalDuration,
-                [`${arrayField}.$.retentionUpdatedAt`]: new Date().toISOString(),
-                'updatedAt': new Date().toISOString()
-            }
-        };
-
-        // Add view count increment and viewedBy if not already viewed
-        if (shouldIncrementView) {
-            updateOperations.$inc = { [`${arrayField}.$.viewCount`]: 1 };
-            updateOperations.$addToSet = { [`${arrayField}.$.viewedBy`]: cleanUserId };
-            log('info', `Will increment view count for ${postId} by ${cleanUserId}`);
-        } else {
-            log('info', `User ${cleanUserId} already viewed ${postId}, skipping view increment`);
-        }
-
+        // ✅ Update the post's retention metrics AND increment view count
         const updateResult = await db.collection('user_slots').updateOne(
             {
                 [`${arrayField}.postId`]: postId
             },
-            updateOperations
+            {
+                $set: {
+                    [`${arrayField}.$.retention`]: Math.round(retentionPercent * 100) / 100,
+                    [`${arrayField}.$.watchedDuration`]: watchedDuration,
+                    [`${arrayField}.$.totalDuration`]: totalDuration,
+                    [`${arrayField}.$.retentionUpdatedAt`]: new Date().toISOString(),
+                    'updatedAt': new Date().toISOString()
+                },
+                $inc: { [`${arrayField}.$.viewCount`]: 1 }
+            }
         );
 
         if (updateResult.matchedCount === 0) {
@@ -626,10 +580,10 @@ app.post('/api/posts/record-retention', writeLimit, async (req, res) => {
         );
 
         const viewCount = updatedSlot && updatedSlot[arrayField] && updatedSlot[arrayField][0]
-            ? Math.max(0, updatedSlot[arrayField][0].viewCount || 0)
-            : 0;
+            ? Math.max(0, updatedSlot[arrayField][0].viewCount || 1)
+            : 1;
 
-        log('info', `Retention recorded successfully: ${cleanUserId} -> ${postId}, ${retentionPercent}%, viewCount: ${viewCount}, incremented: ${shouldIncrementView}`);
+        log('info', `Retention recorded successfully: ${cleanUserId} -> ${postId}, ${retentionPercent}%, viewCount: ${viewCount}`);
         
         // Sync to PORT 2000
         syncMetricsToPort2000(postId, isReel).catch(err => {
@@ -643,8 +597,7 @@ app.post('/api/posts/record-retention', writeLimit, async (req, res) => {
             message: 'Retention recorded successfully',
             postId,
             retentionPercent: Math.round(retentionPercent * 100) / 100,
-            viewCount,
-            viewIncremented: shouldIncrementView
+            viewCount
         });
 
     } catch (error) {
@@ -818,7 +771,7 @@ app.post('/api/posts/toggle-like', writeLimit, async (req, res) => {
 
 
 
-// POST increment view count (only for retention contributors)
+// POST increment view count - SIMPLIFIED (retention already handles this)
 app.post('/api/posts/increment-view', writeLimit, async (req, res) => {
     try {
         const { userId, postId, isReel } = req.body;
@@ -827,25 +780,10 @@ app.post('/api/posts/increment-view', writeLimit, async (req, res) => {
             return res.status(400).json({ error: 'userId and postId required' });
         }
 
-        log('info', `[VIEW-INCREMENT] ${userId} -> ${postId}`);
+        log('info', `[VIEW-INCREMENT-MANUAL] ${userId} -> ${postId}`);
 
         const cleanUserId = validate.sanitize(userId);
         const arrayField = isReel ? 'reelsList' : 'postList';
-
-        // ✅ Check if user already viewed using viewedBy array (this is fine as viewedBy is for counting)
-        const existingView = await db.collection('user_slots').findOne({
-            [`${arrayField}.postId`]: postId,
-            [`${arrayField}.viewedBy`]: cleanUserId
-        });
-
-        if (existingView) {
-            log('info', `[VIEW-DUPLICATE] ${cleanUserId} already viewed ${postId}`);
-            return res.json({ 
-                success: true, 
-                message: 'View already counted', 
-                duplicate: true 
-            });
-        }
 
         // ✅ Check if user contributed retention using post_retention collection
         const retentionCheck = await db.collection('post_retention').findOne({
@@ -853,18 +791,32 @@ app.post('/api/posts/increment-view', writeLimit, async (req, res) => {
             userId: cleanUserId
         }, { projection: { _id: 1 } });
 
-        if (!retentionCheck) {
-            log('warn', `[VIEW-NO-RETENTION] ${cleanUserId} has not contributed retention for ${postId}`);
-            return res.status(403).json({ 
-                error: 'View count only incremented for retention contributors' 
+        if (retentionCheck) {
+            log('info', `[VIEW-INCREMENT-SKIP] ${cleanUserId} already contributed retention for ${postId}`);
+            
+            // Get current count
+            const slot = await db.collection('user_slots').findOne(
+                { [`${arrayField}.postId`]: postId },
+                { projection: { [`${arrayField}.$`]: 1 } }
+            );
+            
+            const viewCount = slot && slot[arrayField] && slot[arrayField][0]
+                ? Math.max(0, slot[arrayField][0].viewCount || 0)
+                : 0;
+            
+            return res.json({
+                success: true,
+                viewCount,
+                message: 'View already counted with retention',
+                duplicate: true
             });
         }
 
+        // Manual increment for edge cases
         const updateResult = await db.collection('user_slots').updateOne(
             { [`${arrayField}.postId`]: postId },
             {
                 $inc: { [`${arrayField}.$.viewCount`]: 1 },
-                $addToSet: { [`${arrayField}.$.viewedBy`]: cleanUserId },
                 $set: { 'updatedAt': new Date().toISOString() }
             }
         );
@@ -883,9 +835,8 @@ app.post('/api/posts/increment-view', writeLimit, async (req, res) => {
             ? Math.max(0, updatedSlot[arrayField][0].viewCount || 1)
             : 1;
 
-        log('info', `[VIEW-SUCCESS] ${cleanUserId} -> ${postId}, new count: ${newViewCount}`);
+        log('info', `[VIEW-SUCCESS-MANUAL] ${cleanUserId} -> ${postId}, new count: ${newViewCount}`);
 
-        // Sync to PORT 2000
         syncMetricsToPort2000(postId, isReel).catch(err => {
             log('error', '[VIEW-SYNC-ERROR]', err.message);
         });
@@ -1261,51 +1212,14 @@ app.post('/api/posts/check-view-contributions', async (req, res) => {
 
         const hasRetentionSet = new Set(retentionRecords.map(r => r.postId));
 
-        // ✅ Single optimized query to check viewedBy from user_slots
-        const [postSlots, reelSlots] = await Promise.all([
-            db.collection('user_slots').find({
-                'postList.postId': { $in: postIds },
-                'postList.viewedBy': cleanUserId
-            }).project({ 'postList.postId': 1, 'postList.viewedBy': 1 }).toArray(),
-            
-            db.collection('user_slots').find({
-                'reelsList.postId': { $in: postIds },
-                'reelsList.viewedBy': cleanUserId
-            }).project({ 'reelsList.postId': 1, 'reelsList.viewedBy': 1 }).toArray()
-        ]);
-
-        const hasViewCountedSet = new Set();
-        
-        postSlots.forEach(slot => {
-            if (slot.postList) {
-                slot.postList.forEach(post => {
-                    if (post.viewedBy && post.viewedBy.includes(cleanUserId)) {
-                        hasViewCountedSet.add(post.postId);
-                    }
-                });
-            }
-        });
-        
-        reelSlots.forEach(slot => {
-            if (slot.reelsList) {
-                slot.reelsList.forEach(reel => {
-                    if (reel.viewedBy && reel.viewedBy.includes(cleanUserId)) {
-                        hasViewCountedSet.add(reel.postId);
-                    }
-                });
-            }
-        });
-
-        // Build result
+        // Build result - if has retention, view was already counted
         for (const postId of postIds) {
             const hasRetention = hasRetentionSet.has(postId);
-            const hasViewCounted = hasViewCountedSet.has(postId);
 
             result[postId] = {
                 hasRetention,
-                hasViewCounted,
-                // View will be auto-incremented when retention is recorded if not already viewed
-                willAutoIncrement: hasRetention && !hasViewCounted
+                hasViewCounted: hasRetention, // View is counted when retention is recorded
+                canIncrementView: !hasRetention // Only if no retention yet
             };
         }
 
