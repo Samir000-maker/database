@@ -620,116 +620,28 @@ app.post('/api/posts/toggle-like', writeLimit, async (req, res) => {
         const cleanUserId = validate.sanitize(userId);
         const action = currentlyLiked ? 'unlike' : 'like';
 
-        // ✅ Find which array contains the post
-        const existingSlot = await db.collection('user_slots').findOne({
-            $or: [
-                { 'postList.postId': postId },
-                { 'reelsList.postId': postId }
-            ]
-        });
-
-        if (!existingSlot) {
-            log('warn', `[LIKE-FALLBACK] Post not found: ${postId}`);
-            
-            // Still process like in post_likes collection
-            const existingLike = await db.collection('post_likes').findOne({
-                postId: postId,
-                userId: cleanUserId
-            });
-
-            if (!currentlyLiked && !existingLike) {
-                await db.collection('post_likes').insertOne({
-                    postId: postId,
-                    userId: cleanUserId,
-                    createdAt: new Date().toISOString()
-                });
-            } else if (currentlyLiked && existingLike) {
-                await db.collection('post_likes').deleteOne({
-                    postId: postId,
-                    userId: cleanUserId
-                });
-            }
-
-            const newLikeCount = await db.collection('post_likes').countDocuments({ postId });
-            
-            return res.json({
-                success: true,
-                action,
-                isLiked: !currentlyLiked,
-                likeCount: newLikeCount,
-                message: `Post not found in user_slots`,
-                fallback: true
-            });
-        }
-
-        // ✅ Determine array field
-        let arrayField = null;
-        const isInPostList = existingSlot.postList && existingSlot.postList.some(item => item.postId === postId);
-        const isInReelsList = existingSlot.reelsList && existingSlot.reelsList.some(item => item.postId === postId);
-
-        if (isInPostList) {
-            arrayField = 'postList';
-        } else if (isInReelsList) {
-            arrayField = 'reelsList';
-        } else {
-            log('error', `[LIKE-ERROR] Post ${postId} not in any array`);
-            return res.status(500).json({ error: 'Data inconsistency' });
-        }
-
-        // ✅ Check actual like state in post_likes
-        const existingLike = await db.collection('post_likes').findOne({
-            postId: postId,
-            userId: cleanUserId
-        });
-
-        const hasLiked = !!existingLike;
-
-        // ✅ State correction
-        if (currentlyLiked && !hasLiked) {
-            const actualCount = await db.collection('post_likes').countDocuments({ postId });
-            log('info', `[STATE-CORRECT] Client thinks liked but isn't - count: ${actualCount}`);
-            return res.json({ 
-                success: true, 
-                message: 'State corrected', 
-                isLiked: false, 
-                likeCount: actualCount,
-                action: 'unlike'
-            });
-        }
-        if (!currentlyLiked && hasLiked) {
-            const actualCount = await db.collection('post_likes').countDocuments({ postId });
-            log('info', `[STATE-CORRECT] Client thinks not liked but is - count: ${actualCount}`);
-            return res.json({ 
-                success: true, 
-                message: 'State corrected', 
-                isLiked: true,
-                likeCount: actualCount,
-                action: 'like'
-            });
-        }
-
-        // ✅ Perform like/unlike in post_likes collection
+        // ✅ STEP 1: Update post_likes collection
+        let likeOperation;
         if (!currentlyLiked) {
-            await db.collection('post_likes').insertOne({
+            likeOperation = await db.collection('post_likes').insertOne({
                 postId: postId,
                 userId: cleanUserId,
                 createdAt: new Date().toISOString()
             });
-            log('info', `[LIKE-ADDED] ${cleanUserId} liked ${postId}`);
+            log('info', `[LIKE-ADDED] ${cleanUserId} -> ${postId}`);
         } else {
-            await db.collection('post_likes').deleteOne({
+            likeOperation = await db.collection('post_likes').deleteOne({
                 postId: postId,
                 userId: cleanUserId
             });
-            log('info', `[LIKE-REMOVED] ${cleanUserId} unliked ${postId}`);
+            log('info', `[LIKE-REMOVED] ${cleanUserId} -> ${postId}`);
         }
 
-        // ✅ Get accurate count from post_likes
+        // ✅ STEP 2: Get updated count
         const newLikeCount = await db.collection('post_likes').countDocuments({ postId });
         
-        log('info', `[LIKE-COUNT-POST] ${postId} now has ${newLikeCount} likes`);
-
-        // ✅ Update user_slots with accurate count (NO likedBy array)
+        // ✅ STEP 3: Update user_slots with new count
+        const arrayField = isReel ? 'reelsList' : 'postList';
         await db.collection('user_slots').updateOne(
             { [`${arrayField}.postId`]: postId },
             {
@@ -742,11 +654,36 @@ app.post('/api/posts/toggle-like', writeLimit, async (req, res) => {
 
         log('info', `[LIKE-SUCCESS] ${action}: ${cleanUserId} -> ${postId}, count: ${newLikeCount}`);
 
-        // Sync to PORT 2000
-        const isReelContent = arrayField === 'reelsList';
-        syncMetricsToPort2000(postId, isReelContent).catch(err => {
-            log('error', '[SYNC-ERROR]', err.message);
-        });
+        // ✅ STEP 4: IMMEDIATE sync to PORT 2000 (single call, no retry)
+        try {
+            const syncPayload = {
+                postId,
+                userId: cleanUserId,
+                action,
+                isLiked: !currentlyLiked,
+                likeCount: newLikeCount,
+                timestamp: new Date().toISOString()
+            };
+
+            log('info', `[SYNC-TRIGGER] Sending like update to PORT 2000:`, syncPayload);
+
+            const syncResponse = await fetch(`${PORT_2000_URL}/api/interactions/sync-like-immediate`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(syncPayload),
+                signal: AbortSignal.timeout(3000) // 3s timeout
+            });
+
+            if (!syncResponse.ok) {
+                log('error', `[SYNC-FAILED] PORT 2000 returned ${syncResponse.status}`);
+            } else {
+                const syncResult = await syncResponse.json();
+                log('info', `[SYNC-SUCCESS] PORT 2000 confirmed:`, syncResult);
+            }
+        } catch (syncError) {
+            log('error', `[SYNC-ERROR] ${syncError.message}`);
+            // Don't fail the like operation if sync fails
+        }
 
         asyncBroadcast();
 
@@ -755,8 +692,7 @@ app.post('/api/posts/toggle-like', writeLimit, async (req, res) => {
             action,
             isLiked: !currentlyLiked,
             likeCount: newLikeCount,
-            message: `Successfully ${action}d`,
-            foundIn: arrayField
+            message: `Successfully ${action}d`
         });
 
     } catch (error) {
@@ -767,7 +703,6 @@ app.post('/api/posts/toggle-like', writeLimit, async (req, res) => {
         });
     }
 });
-
 
 
 
