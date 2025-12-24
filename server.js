@@ -46,6 +46,7 @@ let isShuttingDown = false;
 const pendingSync = new Set(); // Track posts that need sync
 let syncTimeoutId = null;
 
+const SYNC_DEBOUNCE_MS = 2000;
 
 // Logging utility (safe wrapper)
 const log = (level, msg, ...args) => {
@@ -103,6 +104,79 @@ app.use((req, res, next) => {
 if (isShuttingDown) return res.status(503).json({ error: 'Server is shutting down' });
 next();
 });
+
+// ADD the change tracker:
+function trackChange(postId, metrics, isReel) {
+  pendingSync.set(postId, { 
+    metrics, 
+    isReel, 
+    lastUpdate: Date.now() 
+  });
+  
+  // Reset debounce timer
+  if (syncTimeoutId) {
+    clearTimeout(syncTimeoutId);
+  }
+  
+  syncTimeoutId = setTimeout(() => {
+    executeBatchSync();
+  }, SYNC_DEBOUNCE_MS);
+  
+  log('debug', `[TRACK] ${postId} marked, pending: ${pendingSync.size}`);
+}
+
+// ADD the batch executor:
+async function executeBatchSync() {
+  if (pendingSync.size === 0) return;
+  
+  const batch = Array.from(pendingSync.entries());
+  pendingSync.clear();
+  
+  log('info', `[BATCH-SYNC] Syncing ${batch.length} posts to PORT 2000`);
+  
+  try {
+    const metricsMap = {};
+    
+    batch.forEach(([postId, data]) => {
+      metricsMap[postId] = {
+        ...data.metrics,
+        isReel: data.isReel
+      };
+    });
+    
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), 15000);
+    
+    const response = await fetch(`${PORT_2000_URL}/api/sync/batch-metrics`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        metrics: metricsMap,
+        timestamp: new Date().toISOString()
+      }),
+      signal: controller.signal
+    });
+    
+    clearTimeout(timeoutId);
+    
+    if (!response.ok) {
+      throw new Error(`HTTP ${response.status}`);
+    }
+    
+    const result = await response.json();
+    log('info', `[BATCH-SYNC-OK] ${result.updated}/${batch.length} synced`);
+    
+  } catch (error) {
+    log('error', `[BATCH-SYNC-FAIL] ${error.message}`);
+    // Re-add failed items for retry
+    batch.forEach(([postId, data]) => {
+      pendingSync.set(postId, data);
+    });
+    // Retry after 5 seconds
+    setTimeout(executeBatchSync, 5000);
+  }
+}
+
 
 
 function scheduleBatchSync() {
@@ -962,104 +1036,6 @@ return res.status(500).json({ error: 'Failed to increment view count' });
 const ongoingSyncs = new Map();
 const recentlySynced = new Map();
 
-async function syncMetricsToPort2000(postId, isReel, retryCount = 0) {
-const MAX_RETRIES = 3;
-const SYNC_COOLDOWN = 5000;
-
-try {
-if (ongoingSyncs.has(postId)) {
-log('info', `[SYNC-SKIP] ${postId} sync already in progress`);
-return { success: true, skipped: true, reason: 'already_syncing' };
-}
-
-const lastSyncTime = recentlySynced.get(postId);
-if (lastSyncTime && (Date.now() - lastSyncTime) < SYNC_COOLDOWN) {
-log('info', `[SYNC-SKIP] ${postId} synced ${Date.now() - lastSyncTime}ms ago (cooldown: ${SYNC_COOLDOWN}ms)`);
-return { success: true, skipped: true, reason: 'recently_synced' };
-}
-
-ongoingSyncs.set(postId, Date.now());
-
-const arrayField = isReel ? 'reelsList' : 'postList';
-
-// Get current metrics from PORT 4000
-const slot = await db.collection('user_slots').findOne({
-[`${arrayField}.postId`]: postId
-});
-
-if (!slot) {
-log('warn', `[SYNC] Post not found for sync: ${postId}`);
-ongoingSyncs.delete(postId);
-return null;
-}
-
-const content = slot[arrayField]?.find(item => item.postId === postId);
-if (!content) {
-log('warn', `[SYNC] Content not found in array: ${postId}`);
-ongoingSyncs.delete(postId);
-return null;
-}
-
-const metrics = {
-likeCount: content.likeCount || 0,
-commentCount: content.commentCount || 0, // ✅ Ensure this is included
-viewCount: content.viewCount || 0,
-retention: content.retention || 0
-};
-
-log('info', `[SYNC-ATTEMPT ${retryCount + 1}] ${postId}:`, metrics);
-
-const controller = new AbortController();
-const timeoutId = setTimeout(() => controller.abort(), 10000);
-
-const response = await fetch(`${PORT_2000_URL}/api/sync/metrics`, {
-method: 'POST',
-headers: { 'Content-Type': 'application/json' },
-body: JSON.stringify({
-postId,
-metrics,
-isReel,
-sourceServer: 'PORT_4000',
-timestamp: new Date().toISOString()
-}),
-signal: controller.signal
-});
-
-clearTimeout(timeoutId);
-
-if (!response.ok) {
-const errorText = await response.text();
-throw new Error(`HTTP ${response.status}: ${errorText}`);
-}
-
-const result = await response.json();
-log('info', `[SYNC-SUCCESS] ${postId}:`, result);
-
-recentlySynced.set(postId, Date.now());
-cleanupRecentlySynced();
-
-return result;
-
-} catch (error) {
-log('error', `[SYNC-ERROR-RETRY-${retryCount}] ${postId}:`, error.message);
-
-if (retryCount < MAX_RETRIES && error.name !== 'AbortError') {
-const delay = Math.pow(2, retryCount) * 1000;
-log('info', `[SYNC-RETRY] Waiting ${delay}ms before retry ${retryCount + 1}...`);
-
-ongoingSyncs.delete(postId);
-
-await new Promise(resolve => setTimeout(resolve, delay));
-return syncMetricsToPort2000(postId, isReel, retryCount + 1);
-}
-
-log('error', `[SYNC-FAILED-FINAL] ${postId} after ${MAX_RETRIES} retries`);
-return null;
-
-} finally {
-ongoingSyncs.delete(postId);
-}
-}
 
 function trackChange(postId) {
   pendingSync.add(postId);
@@ -1083,55 +1059,6 @@ recentlySynced.delete(postId);
 setInterval(cleanupRecentlySynced, 120000);
 
 
-
-
-async function periodicFullSync() {
-try {
-log('info', '[PERIODIC-SYNC] Starting full database sync...');
-
-const allSlots = await db.collection('user_slots').find({}).toArray();
-
-let syncedPosts = 0;
-let syncedReels = 0;
-let failures = 0;
-
-for (const slot of allSlots) {
-// Sync posts
-if (Array.isArray(slot.postList)) {
-for (const post of slot.postList) {
-const result = await syncMetricsToPort2000(post.postId, false);
-if (result) syncedPosts++;
-else failures++;
-
-// Small delay to avoid overwhelming server
-await new Promise(resolve => setTimeout(resolve, 100));
-}
-}
-
-// Sync reels
-if (Array.isArray(slot.reelsList)) {
-for (const reel of slot.reelsList) {
-const result = await syncMetricsToPort2000(reel.postId, true);
-if (result) syncedReels++;
-else failures++;
-
-await new Promise(resolve => setTimeout(resolve, 100));
-}
-}
-}
-
-log('info', `[PERIODIC-SYNC-COMPLETE] Posts: ${syncedPosts}, Reels: ${syncedReels}, Failures: ${failures}`);
-
-} catch (error) {
-log('error', '[PERIODIC-SYNC-ERROR]', error.message);
-}
-}
-
-
-
-
-
-///
 
 
 
@@ -1221,35 +1148,6 @@ log('info', '[AUTO-SYNC] Stopped');
 }
 }
 
-
-
-
-////
-
-
-
-// Start periodic sync on server startup (after MongoDB init)
-function startPeriodicSync() {
-// Initial sync after 30 seconds
-setTimeout(() => {
-// periodicFullSync();
-}, 30000);
-
-// Then sync every 5 minutes
-syncIntervalId = setInterval(() => {
-periodicFullSync();
-}, 5 * 60 * 1000);
-
-log('info', '[PERIODIC-SYNC] Started (every 5 minutes)');
-}
-
-// Stop periodic sync on shutdown
-function stopPeriodicSync() {
-if (syncIntervalId) {
-clearInterval(syncIntervalId);
-log('info', '[PERIODIC-SYNC] Stopped');
-}
-}
 
 app.post('/api/admin/sync-likes', async (req, res) => {
 try {
@@ -1609,7 +1507,12 @@ $set: { updatedAt: now }
 
 log('info', `[COMMENT-ADDED] ${postId}, syncing to PORT 2000...`);
 
-trackChange(postId);
+    trackChange(postId, {
+      likeCount: updatedSlot?.[arrayField]?.[0]?.likeCount || 0,
+      commentCount: updatedSlot?.[arrayField]?.[0]?.commentCount || 0,
+      viewCount,
+      retention: Math.round(retentionPercent * 100) / 100
+    }, isReel);
 
 asyncBroadcast();
 
