@@ -43,6 +43,10 @@ const sseClients = new Set();
 let isShuttingDown = false;
 
 
+const pendingSync = new Set(); // Track posts that need sync
+let syncTimeoutId = null;
+
+
 // Logging utility (safe wrapper)
 const log = (level, msg, ...args) => {
 const timestamp = new Date().toISOString();
@@ -99,6 +103,109 @@ app.use((req, res, next) => {
 if (isShuttingDown) return res.status(503).json({ error: 'Server is shutting down' });
 next();
 });
+
+
+function scheduleBatchSync() {
+  if (syncTimeoutId) {
+    clearTimeout(syncTimeoutId);
+  }
+  
+  syncTimeoutId = setTimeout(async () => {
+    if (pendingSync.size === 0) return;
+    
+    const postsToSync = Array.from(pendingSync);
+    pendingSync.clear();
+    
+    log('info', `[BATCH-SYNC] Syncing ${postsToSync.length} changed posts`);
+    
+    await batchSyncMetrics(postsToSync);
+  }, 2000); // Wait 2 seconds after last change
+}
+
+// NEW: Batch sync multiple posts in ONE request
+async function batchSyncMetrics(postIds) {
+  try {
+    const metricsMap = {};
+    
+    // Gather all metrics in one query
+    const slots = await db.collection('user_slots')
+      .find({
+        $or: [
+          { 'postList.postId': { $in: postIds } },
+          { 'reelsList.postId': { $in: postIds } }
+        ]
+      })
+      .toArray();
+    
+    // Build metrics map
+    slots.forEach(slot => {
+      // Check posts
+      if (slot.postList) {
+        slot.postList.forEach(post => {
+          if (postIds.includes(post.postId)) {
+            metricsMap[post.postId] = {
+              likeCount: post.likeCount || 0,
+              commentCount: post.commentCount || 0,
+              viewCount: post.viewCount || 0,
+              retention: post.retention || 0,
+              isReel: false
+            };
+          }
+        });
+      }
+      
+      // Check reels
+      if (slot.reelsList) {
+        slot.reelsList.forEach(reel => {
+          if (postIds.includes(reel.postId)) {
+            metricsMap[reel.postId] = {
+              likeCount: reel.likeCount || 0,
+              commentCount: reel.commentCount || 0,
+              viewCount: reel.viewCount || 0,
+              retention: reel.retention || 0,
+              isReel: true
+            };
+          }
+        });
+      }
+    });
+    
+    if (Object.keys(metricsMap).length === 0) {
+      log('warn', '[BATCH-SYNC] No metrics found for posts');
+      return;
+    }
+    
+    // Single request to PORT 2000
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), 15000);
+    
+    const response = await fetch(`${PORT_2000_URL}/api/sync/batch-metrics`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        metrics: metricsMap,
+        timestamp: new Date().toISOString()
+      }),
+      signal: controller.signal
+    });
+    
+    clearTimeout(timeoutId);
+    
+    if (!response.ok) {
+      throw new Error(`HTTP ${response.status}`);
+    }
+    
+    const result = await response.json();
+    log('info', `[BATCH-SYNC-SUCCESS] Synced ${result.updated} posts`);
+    
+  } catch (error) {
+    log('error', `[BATCH-SYNC-ERROR]`, error.message);
+    // On failure, re-add to pending for retry
+    postIds.forEach(id => pendingSync.add(id));
+    scheduleBatchSync(); // Retry after delay
+  }
+}
+
 
 // MongoDB initialization
 async function initMongo() {
@@ -585,10 +692,7 @@ const viewCount = updatedSlot && updatedSlot[arrayField] && updatedSlot[arrayFie
 
 log('info', `Retention recorded successfully: ${cleanUserId} -> ${postId}, ${retentionPercent}%, viewCount: ${viewCount}`);
 
-// Sync to PORT 2000
-syncMetricsToPort2000(postId, isReel).catch(err => {
-log('error', '[RETENTION-SYNC-ERROR]', err.message);
-});
+trackChange(postId);
 
 asyncBroadcast();
 
@@ -605,6 +709,9 @@ log('error', 'Retention recording error:', error && error.message ? error.messag
 res.status(500).json({ error: 'Internal server error' });
 }
 });
+
+
+
 
 // Replace the existing toggle-like endpoint
 app.post('/api/posts/toggle-like', writeLimit, async (req, res) => {
@@ -744,9 +851,7 @@ log('info', `[LIKE-SUCCESS] ${action}: ${cleanUserId} -> ${postId}, count: ${new
 
 // Sync to PORT 2000
 const isReelContent = arrayField === 'reelsList';
-syncMetricsToPort2000(postId, isReelContent).catch(err => {
-log('error', '[SYNC-ERROR]', err.message);
-});
+trackChange(postId);
 
 asyncBroadcast();
 
@@ -837,9 +942,7 @@ const newViewCount = updatedSlot && updatedSlot[arrayField] && updatedSlot[array
 
 log('info', `[VIEW-SUCCESS-MANUAL] ${cleanUserId} -> ${postId}, new count: ${newViewCount}`);
 
-syncMetricsToPort2000(postId, isReel).catch(err => {
-log('error', '[VIEW-SYNC-ERROR]', err.message);
-});
+trackChange(postId);
 
 asyncBroadcast();
 
@@ -956,6 +1059,12 @@ return null;
 } finally {
 ongoingSyncs.delete(postId);
 }
+}
+
+function trackChange(postId) {
+  pendingSync.add(postId);
+  scheduleBatchSync();
+  log('debug', `[TRACK-CHANGE] ${postId} marked for sync`);
 }
 
 // Cleanup function to prevent memory leaks
@@ -1123,7 +1232,7 @@ log('info', '[AUTO-SYNC] Stopped');
 function startPeriodicSync() {
 // Initial sync after 30 seconds
 setTimeout(() => {
-periodicFullSync();
+// periodicFullSync();
 }, 30000);
 
 // Then sync every 5 minutes
@@ -1500,10 +1609,7 @@ $set: { updatedAt: now }
 
 log('info', `[COMMENT-ADDED] ${postId}, syncing to PORT 2000...`);
 
-// Sync to PORT 2000
-syncMetricsToPort2000(postId, isReel).catch(err => {
-log('error', '[COMMENT-SYNC-ERROR]', err.message);
-});
+trackChange(postId);
 
 asyncBroadcast();
 
@@ -2605,7 +2711,7 @@ log('debug', 'Error closing SSE client:', error && error.message ? error.message
 }
 sseClients.clear();
 
-stopPeriodicSync();
+// stopPeriodicSync();
 
 // Close server
 if (server && server.close) {
@@ -2649,9 +2755,9 @@ async function startServer() {
 try {
 await initMongo();
 
-startPeriodicSync();
+// startPeriodicSync();
 // startPeriodicLikeSync();
-startAutoLikeSync();
+// startAutoLikeSync();
 
 server = app.listen(PORT, HOST, () => {
 log('info', `🚀 Server listening on http://${HOST}:${PORT}/`);
