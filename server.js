@@ -25,6 +25,45 @@ const MAX_LIKED_BY_PER_POST = 1000;
 const PORT_2000_URL = process.env.PORT_2000_URL || 'https://samir-hgr9.onrender.com';
 
 
+class SimpleCache {
+  constructor(ttlMs = 60000) { // Default 1 minute TTL
+    this.cache = new Map();
+    this.ttl = ttlMs;
+  }
+
+  set(key, value) {
+    this.cache.set(key, {
+      value,
+      expiry: Date.now() + this.ttl
+    });
+  }
+
+  get(key) {
+    const item = this.cache.get(key);
+    if (!item) return null;
+    
+    if (Date.now() > item.expiry) {
+      this.cache.delete(key);
+      return null;
+    }
+    
+    return item.value;
+  }
+
+  delete(key) {
+    this.cache.delete(key);
+  }
+
+  clear() {
+    this.cache.clear();
+  }
+
+  size() {
+    return this.cache.size;
+  }
+}
+
+
 const likeCountCache = new SimpleCache(30000); // 30 seconds
 const commentCountCache = new SimpleCache(30000);
 const userSlotsCache = new SimpleCache(60000); // 1 minute
@@ -148,43 +187,7 @@ const requestStats = {
 
 
 
-class SimpleCache {
-  constructor(ttlMs = 60000) { // Default 1 minute TTL
-    this.cache = new Map();
-    this.ttl = ttlMs;
-  }
 
-  set(key, value) {
-    this.cache.set(key, {
-      value,
-      expiry: Date.now() + this.ttl
-    });
-  }
-
-  get(key) {
-    const item = this.cache.get(key);
-    if (!item) return null;
-    
-    if (Date.now() > item.expiry) {
-      this.cache.delete(key);
-      return null;
-    }
-    
-    return item.value;
-  }
-
-  delete(key) {
-    this.cache.delete(key);
-  }
-
-  clear() {
-    this.cache.clear();
-  }
-
-  size() {
-    return this.cache.size;
-  }
-}
 
 
 
