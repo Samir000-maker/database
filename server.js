@@ -1164,6 +1164,10 @@ app.post('/api/posts/toggle-like', writeLimit, async (req, res) => {
       }
     }
 
+// Invalidate cache on like toggle
+// Add after successful like/unlike in toggle-like endpoint:
+    likeCountCache.delete(postId);
+
     asyncBroadcast();
   } catch (error) {
     log('error', `[LIKE-UPDATE-ASYNC-ERROR] ${postId}:`, error.message);
@@ -2536,9 +2540,7 @@ app.get('/api/posts/get-like-count/:postId', async (req, res) => {
   }
 });
 
-// Invalidate cache on like toggle
-// Add after successful like/unlike in toggle-like endpoint:
-likeCountCache.delete(postId);
+
 
 
 app.post('/api/posts/batch-check-liked', async (req, res) => {
