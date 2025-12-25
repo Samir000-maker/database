@@ -64,13 +64,6 @@ class SimpleCache {
 }
 
 
-const likeCountCache = new SimpleCache(30000); // 30 seconds
-const commentCountCache = new SimpleCache(30000);
-const userSlotsCache = new SimpleCache(60000); // 1 minute
-
-const mongoMetrics = new MongoMetrics();
-
-
 
 class MongoMetrics {
   constructor() {
@@ -136,6 +129,14 @@ class MongoMetrics {
     // Keep slow queries for analysis
   }
 }
+
+
+
+const likeCountCache = new SimpleCache(30000); // 30 seconds
+const commentCountCache = new SimpleCache(30000);
+const userSlotsCache = new SimpleCache(60000); // 1 minute
+
+const mongoMetrics = new MongoMetrics();
 
 
 
