@@ -15,6 +15,7 @@ const app = express();
 app.set('trust proxy', 1);
 
 // Configuration
+const HOST = process.env.HOST || '0.0.0.0';
 const PORT = parseInt(process.env.PORT, 10) || 4000;
 const MONGODB_URI = process.env.MONGODB_URI || 'mongodb+srv://samir_:fitara@cluster0.cmatn6k.mongodb.net/leveldb_converted?retryWrites=true&w=majority';
 const DB_NAME = process.env.DB_NAME || 'leveldb_converted';
