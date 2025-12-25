@@ -7,6 +7,7 @@ const path = require('path');
 const rateLimit = require('express-rate-limit');
 const helmet = require('helmet');
 const compression = require('compression');
+const { performance } = require('perf_hooks');
 
 const app = express();
 
@@ -15,7 +16,6 @@ app.set('trust proxy', 1);
 
 // Configuration
 const PORT = parseInt(process.env.PORT, 10) || 4000;
-const HOST = process.env.HOST || '0.0.0.0';
 const MONGODB_URI = process.env.MONGODB_URI || 'mongodb+srv://samir_:fitara@cluster0.cmatn6k.mongodb.net/leveldb_converted?retryWrites=true&w=majority';
 const DB_NAME = process.env.DB_NAME || 'leveldb_converted';
 const NODE_ENV = process.env.NODE_ENV || 'development';
@@ -23,6 +23,87 @@ const NODE_ENV = process.env.NODE_ENV || 'development';
 const SLOT_CAPACITY = 250;
 const MAX_LIKED_BY_PER_POST = 1000;
 const PORT_2000_URL = process.env.PORT_2000_URL || 'https://samir-hgr9.onrender.com';
+
+
+const likeCountCache = new SimpleCache(30000); // 30 seconds
+const commentCountCache = new SimpleCache(30000);
+const userSlotsCache = new SimpleCache(60000); // 1 minute
+
+const mongoMetrics = new MongoMetrics();
+
+
+
+class MongoMetrics {
+  constructor() {
+    this.reads = 0;
+    this.writes = 0;
+    this.docsExamined = 0;
+    this.docsReturned = 0;
+    this.queryTimes = [];
+    this.slowQueries = [];
+  }
+
+  trackQuery(operation, duration, docs Examined, docsReturned, query) {
+    if (operation.includes('find') || operation.includes('findOne') || operation.includes('count')) {
+      this.reads++;
+    } else {
+      this.writes++;
+    }
+    
+    this.docsExamined += docsExamined || 0;
+    this.docsReturned += docsReturned || 0;
+    this.queryTimes.push(duration);
+
+    if (duration > 100) { // Slow query threshold: 100ms
+      this.slowQueries.push({
+        operation,
+        duration,
+        docsExamined,
+        docsReturned,
+        query: JSON.stringify(query).substring(0, 200),
+        timestamp: new Date().toISOString()
+      });
+    }
+  }
+
+  getStats() {
+    const avgQueryTime = this.queryTimes.length > 0 
+      ? this.queryTimes.reduce((a, b) => a + b, 0) / this.queryTimes.length 
+      : 0;
+
+    return {
+      totalReads: this.reads,
+      totalWrites: this.writes,
+      totalDocsExamined: this.docsExamined,
+      totalDocsReturned: this.docsReturned,
+      avgQueryTime: avgQueryTime.toFixed(2) + 'ms',
+      slowQueriesCount: this.slowQueries.length,
+      efficiency: this.docsReturned > 0 
+        ? ((this.docsReturned / this.docsExamined) * 100).toFixed(2) + '%'
+        : '0%'
+    };
+  }
+
+  getSlowQueries() {
+    return this.slowQueries.slice(-50); // Last 50 slow queries
+  }
+
+  reset() {
+    this.reads = 0;
+    this.writes = 0;
+    this.docsExamined = 0;
+    this.docsReturned = 0;
+    this.queryTimes = [];
+    // Keep slow queries for analysis
+  }
+}
+
+
+
+
+
+let totalRequests = 0;
+let activeRequests = 0;
 
 let client = null;
 let db = null;
@@ -56,6 +137,73 @@ const validate = {
   sanitize: (input) => typeof input === 'string' ? input.trim() : input
 };
 
+
+
+const requestStats = {
+  byEndpoint: {},
+  byMethod: {},
+  responseTimeSum: 0,
+  responseTimeCount: 0
+};
+
+
+
+class SimpleCache {
+  constructor(ttlMs = 60000) { // Default 1 minute TTL
+    this.cache = new Map();
+    this.ttl = ttlMs;
+  }
+
+  set(key, value) {
+    this.cache.set(key, {
+      value,
+      expiry: Date.now() + this.ttl
+    });
+  }
+
+  get(key) {
+    const item = this.cache.get(key);
+    if (!item) return null;
+    
+    if (Date.now() > item.expiry) {
+      this.cache.delete(key);
+      return null;
+    }
+    
+    return item.value;
+  }
+
+  delete(key) {
+    this.cache.delete(key);
+  }
+
+  clear() {
+    this.cache.clear();
+  }
+
+  size() {
+    return this.cache.size;
+  }
+}
+
+
+
+setInterval(() => {
+  const before = likeCountCache.size() + commentCountCache.size() + userSlotsCache.size();
+  
+  // Trigger cleanup by attempting to get non-existent key
+  likeCountCache.get('__cleanup__');
+  commentCountCache.get('__cleanup__');
+  userSlotsCache.get('__cleanup__');
+  
+  const after = likeCountCache.size() + commentCountCache.size() + userSlotsCache.size();
+  
+  if (before !== after) {
+    log('debug', `[CACHE-CLEANUP] Removed ${before - after} expired entries`);
+  }
+}, 60000);
+
+
 // Middleware setup
 app.use(helmet({
   contentSecurityPolicy: {
@@ -68,6 +216,46 @@ app.use(helmet({
     }
   }
 }));
+
+
+
+app.use((req, res, next) => {
+  if (isShuttingDown) return res.status(503).json({ error: 'Server is shutting down' });
+  
+  totalRequests++;
+  activeRequests++;
+  
+  const start = performance.now();
+  const endpoint = req.route ? req.route.path : req.path;
+  const method = req.method;
+
+  // Track by endpoint
+  if (!requestStats.byEndpoint[endpoint]) {
+    requestStats.byEndpoint[endpoint] = { count: 0, totalTime: 0 };
+  }
+  requestStats.byEndpoint[endpoint].count++;
+
+  // Track by method
+  if (!requestStats.byMethod[method]) {
+    requestStats.byMethod[method] = 0;
+  }
+  requestStats.byMethod[method]++;
+
+  res.on('finish', () => {
+    activeRequests--;
+    const duration = performance.now() - start;
+    
+    requestStats.byEndpoint[endpoint].totalTime += duration;
+    requestStats.responseTimeSum += duration;
+    requestStats.responseTimeCount++;
+
+    log('info', `[REQUEST] ${method} ${endpoint} - ${res.statusCode} - ${duration.toFixed(2)}ms - Active: ${activeRequests}`);
+  });
+
+  next();
+});
+
+
 app.use(compression());
 
 app.use(rateLimit({
@@ -86,11 +274,6 @@ app.use(express.json({ limit: '10mb' }));
 app.use(cors());
 app.use(express.static(path.join(__dirname, 'public')));
 
-// Shutdown check middleware
-app.use((req, res, next) => {
-  if (isShuttingDown) return res.status(503).json({ error: 'Server is shutting down' });
-  next();
-});
 
 // Change tracker for event-driven sync
 function trackChange(postId, metrics, isReel) {
@@ -111,6 +294,138 @@ function trackChange(postId, metrics, isReel) {
 
   log('debug', `[TRACK] ${postId} marked, pending: ${pendingSync.size}`);
 }
+
+
+
+
+
+async function trackedFind(collection, query, options = {}) {
+  const start = performance.now();
+  const cursor = db.collection(collection).find(query, options);
+  const results = await cursor.toArray();
+  
+  // Get explain data for tracking
+  const explain = await db.collection(collection)
+    .find(query, options)
+    .explain('executionStats');
+  
+  const duration = performance.now() - start;
+  const stats = explain.executionStats;
+  
+  mongoMetrics.trackQuery(
+    `find:${collection}`,
+    duration,
+    stats.totalDocsExamined,
+    stats.nReturned,
+    query
+  );
+
+  log('debug', `[MONGO-READ] ${collection}: examined=${stats.totalDocsExamined}, returned=${stats.nReturned}, time=${duration.toFixed(2)}ms`);
+
+  return results;
+}
+
+async function trackedFindOne(collection, query, options = {}) {
+  const start = performance.now();
+  const result = await db.collection(collection).findOne(query, options);
+  const duration = performance.now() - start;
+  
+  // Estimate: findOne typically examines 1 doc if indexed, more if not
+  mongoMetrics.trackQuery(
+    `findOne:${collection}`,
+    duration,
+    result ? 1 : 0,
+    result ? 1 : 0,
+    query
+  );
+
+  log('debug', `[MONGO-READ] ${collection}.findOne: time=${duration.toFixed(2)}ms, found=${!!result}`);
+
+  return result;
+}
+
+async function trackedUpdateOne(collection, filter, update, options = {}) {
+  const start = performance.now();
+  const result = await db.collection(collection).updateOne(filter, update, options);
+  const duration = performance.now() - start;
+  
+  mongoMetrics.trackQuery(
+    `updateOne:${collection}`,
+    duration,
+    result.matchedCount,
+    result.modifiedCount,
+    filter
+  );
+
+  log('debug', `[MONGO-WRITE] ${collection}.updateOne: matched=${result.matchedCount}, modified=${result.modifiedCount}, time=${duration.toFixed(2)}ms`);
+
+  return result;
+}
+
+async function trackedInsertOne(collection, document) {
+  const start = performance.now();
+  const result = await db.collection(collection).insertOne(document);
+  const duration = performance.now() - start;
+  
+  mongoMetrics.trackQuery(
+    `insertOne:${collection}`,
+    duration,
+    0,
+    1,
+    {}
+  );
+
+  log('debug', `[MONGO-WRITE] ${collection}.insertOne: time=${duration.toFixed(2)}ms`);
+
+  return result;
+}
+
+async function trackedDeleteOne(collection, filter) {
+  const start = performance.now();
+  const result = await db.collection(collection).deleteOne(filter);
+  const duration = performance.now() - start;
+  
+  mongoMetrics.trackQuery(
+    `deleteOne:${collection}`,
+    duration,
+    result.deletedCount,
+    result.deletedCount,
+    filter
+  );
+
+  log('debug', `[MONGO-WRITE] ${collection}.deleteOne: deleted=${result.deletedCount}, time=${duration.toFixed(2)}ms`);
+
+  return result;
+}
+
+async function trackedCountDocuments(collection, query) {
+  const start = performance.now();
+  
+  // Use estimatedDocumentCount for empty queries, much faster
+  const count = Object.keys(query).length === 0
+    ? await db.collection(collection).estimatedDocumentCount()
+    : await db.collection(collection).countDocuments(query);
+    
+  const duration = performance.now() - start;
+  
+  // countDocuments examines all matching documents
+  mongoMetrics.trackQuery(
+    `count:${collection}`,
+    duration,
+    count, // Examines all matching docs
+    1, // Returns 1 number
+    query
+  );
+
+  log('debug', `[MONGO-READ] ${collection}.count: result=${count}, time=${duration.toFixed(2)}ms`);
+
+  return count;
+}
+
+
+
+
+
 
 // Batch executor for syncing to PORT 2000
 async function executeBatchSync() {
@@ -164,6 +479,179 @@ async function executeBatchSync() {
   }
 }
 
+
+
+
+async function setupCriticalIndexes() {
+  try {
+    const indexDefinitions = [
+      // ===== USER_SLOTS COLLECTION =====
+      {
+        collection: 'user_slots',
+        indexes: [
+          // Existing unique index
+          { 
+            index: { userId: 1, slotIndex: 1 }, 
+            options: { unique: true, background: true } 
+          },
+          
+          // NEW: For fast user content lookups
+          { 
+            index: { userId: 1 }, 
+            options: { background: true } 
+          },
+          
+          // NEW: For finding posts by postId in postList array
+          { 
+            index: { 'postList.postId': 1 }, 
+            options: { background: true } 
+          },
+          
+          // NEW: For finding reels by postId in reelsList array
+          { 
+            index: { 'reelsList.postId': 1 }, 
+            options: { background: true } 
+          },
+          
+          // NEW: Compound index for efficient array element updates
+          { 
+            index: { userId: 1, 'postList.postId': 1 }, 
+            options: { background: true, sparse: true }
+          },
+          { 
+            index: { userId: 1, 'reelsList.postId': 1 }, 
+            options: { background: true, sparse: true }
+          },
+          
+          // NEW: For sorting by updatedAt
+          { 
+            index: { userId: 1, updatedAt: -1 }, 
+            options: { background: true } 
+          }
+        ]
+      },
+
+      // ===== POST_LIKES COLLECTION =====
+      {
+        collection: 'post_likes',
+        indexes: [
+          { 
+            index: { postId: 1, userId: 1 }, 
+            options: { unique: true, background: true } 
+          },
+          { 
+            index: { postId: 1 }, 
+            options: { background: true } 
+          },
+          { 
+            index: { userId: 1 }, 
+            options: { background: true } 
+          },
+          
+          // NEW: Covered query for like count
+          { 
+            index: { postId: 1, _id: 1 }, 
+            options: { background: true }
+          }
+        ]
+      },
+
+      // ===== POST_RETENTION COLLECTION =====
+      {
+        collection: 'post_retention',
+        indexes: [
+          { 
+            index: { postId: 1, userId: 1 }, 
+            options: { unique: true, background: true } 
+          },
+          { 
+            index: { postId: 1 }, 
+            options: { background: true } 
+          },
+          { 
+            index: { userId: 1 }, 
+            options: { background: true } 
+          }
+        ]
+      },
+
+      // ===== COMMENTS COLLECTION =====
+      {
+        collection: 'comments',
+        indexes: [
+          { 
+            index: { postId: 1, createdAt: -1 }, 
+            options: { background: true } 
+          },
+          { 
+            index: { parentId: 1, createdAt: 1 }, 
+            options: { background: true } 
+          },
+          { 
+            index: { userId: 1, createdAt: -1 }, 
+            options: { background: true } 
+          },
+          { 
+            index: { postId: 1, parentId: 1 }, 
+            options: { background: true } 
+          }
+        ]
+      },
+
+      // ===== CONTRIBUTED_VIEWS_FOLLOWING =====
+      {
+        collection: 'contributed_views_following',
+        indexes: [
+          { 
+            index: { userId: 1 }, 
+            options: { background: true } 
+          },
+          { 
+            index: { documentName: 1 }, 
+            options: { background: true } 
+          },
+          { 
+            index: { userId: 1, documentName: 1 }, 
+            options: { background: true } 
+          },
+          
+          // NEW: For array lookups
+          { 
+            index: { PostList: 1 }, 
+            options: { background: true, sparse: true } 
+          },
+          { 
+            index: { reelsList: 1 }, 
+            options: { background: true, sparse: true } 
+          }
+        ]
+      }
+    ];
+
+    for (const { collection, indexes } of indexDefinitions) {
+      for (const { index, options } of indexes) {
+        try {
+          await db.collection(collection).createIndex(index, options);
+          log('info', `✓ Created index on ${collection}:`, JSON.stringify(index));
+        } catch (error) {
+          // Ignore duplicate index errors (code 85 or 86)
+          if (error.code !== 85 && error.code !== 86) {
+            log('warn', `Index creation warning for ${collection}:`, error.message);
+          }
+        }
+      }
+    }
+
+    log('info', '✅ All critical indexes ensured successfully');
+  } catch (error) {
+    log('error', 'Critical index setup failed:', error.message);
+    throw error; // Fail startup if critical indexes can't be created
+  }
+}
+
+
+
+
 // MongoDB initialization
 async function initMongo() {
   try {
@@ -181,105 +669,7 @@ async function initMongo() {
     await db.admin().ping();
     log('info', 'MongoDB connection established successfully');
 
-    // Create indexes (best-effort; don't fail startup on index errors)
-    const indexes = [
-      { collection: 'user_slots', index: { userId: 1, slotIndex: 1 }, options: { unique: true, background: true } },
-      { collection: 'contributed_views_following', index: { userId: 1 }, options: { background: true } },
-      { collection: 'contributed_views_following', index: { documentName: 1 }, options: { background: true } },
-      { collection: 'contributed_views_following', index: { userId: 1, documentName: 1 }, options: { background: true } }
-    ];
-
-    for (const { collection, index, options } of indexes) {
-      try {
-        await db.collection(collection).createIndex(index, options);
-        log('info', `Ensured index for ${collection}`);
-      } catch (e) {
-        log('warn', `Index creation error for ${collection}: ${e && e.message ? e.message : e}`);
-      }
-    }
-
-    log('info', `Connected to MongoDB at ${MONGODB_URI}, db: ${DB_NAME}`);
-
-    // Post retention indexes
-    const postRetentionIndexes = [
-      {
-        collection: 'post_retention',
-        index: { postId: 1, userId: 1 },
-        options: { unique: true, background: true }
-      },
-      {
-        collection: 'post_retention',
-        index: { postId: 1 },
-        options: { background: true }
-      },
-      {
-        collection: 'post_retention',
-        index: { userId: 1 },
-        options: { background: true }
-      }
-    ];
-
-    for (const { collection, index, options } of postRetentionIndexes) {
-      try {
-        await db.collection(collection).createIndex(index, options);
-        log('info', `Created index for ${collection}`);
-      } catch (e) {
-        log('warn', `Index error for ${collection}: ${e.message}`);
-      }
-    }
-
-    // Post likes indexes
-    const postLikesIndexes = [
-      {
-        collection: 'post_likes',
-        index: { postId: 1, userId: 1 },
-        options: { unique: true, background: true }
-      },
-      {
-        collection: 'post_likes',
-        index: { postId: 1 },
-        options: { background: true }
-      },
-      {
-        collection: 'post_likes',
-        index: { userId: 1 },
-        options: { background: true }
-      }
-    ];
-
-    for (const { collection, index, options } of postLikesIndexes) {
-      try {
-        await db.collection(collection).createIndex(index, options);
-        log('info', `Created index for ${collection}`);
-      } catch (e) {
-        log('warn', `Index error for ${collection}: ${e.message}`);
-      }
-    }
-
-    await setupCommentIndexes();
-
-    // Comment count indexes
-    const commentCountIndexes = [
-      {
-        collection: 'user_slots',
-        index: { 'postList.postId': 1 },
-        options: { background: true }
-      },
-      {
-        collection: 'user_slots',
-        index: { 'reelsList.postId': 1 },
-        options: { background: true }
-      }
-    ];
-
-    for (const { collection, index, options } of commentCountIndexes) {
-      try {
-        await db.collection(collection).createIndex(index, options);
-        log('info', `Created comment-count index for ${collection}`);
-      } catch (e) {
-        log('warn', `Comment-count index error for ${collection}: ${e.message}`);
-      }
-    }
+    await setupCriticalIndexes();
 
   } catch (error) {
     log('error', 'MongoDB initialization failed:', error && error.message ? error.message : error);
@@ -287,43 +677,22 @@ async function initMongo() {
   }
 }
 
-async function setupCommentIndexes() {
-  try {
-    const commentsCollection = db.collection('comments');
 
-    // Compound index for fetching comments by post with pagination
-    await commentsCollection.createIndex(
-      { postId: 1, createdAt: -1 },
-      { background: true }
-    );
 
-    // Index for finding replies to a comment
-    await commentsCollection.createIndex(
-      { parentId: 1, createdAt: 1 },
-      { background: true }
-    );
+const MAX_SSE_CLIENTS = 10000; // Hard limit
+let lastBroadcastTime = 0;
+const BROADCAST_THROTTLE_MS = 1000; // Max 1 broadcast per second
 
-    // Index for user's comments
-    await commentsCollection.createIndex(
-      { userId: 1, createdAt: -1 },
-      { background: true }
-    );
-
-    // Compound index for comment count aggregation
-    await commentsCollection.createIndex(
-      { postId: 1, parentId: 1 },
-      { background: true }
-    );
-
-    log('info', 'Comment indexes created successfully');
-  } catch (error) {
-    log('error', 'Comment index creation error:', error.message);
-  }
-}
-
-// SSE broadcast utility
 function broadcastUpdate(data) {
   if (sseClients.size === 0) return;
+  
+  // Throttle broadcasts
+  const now = Date.now();
+  if (now - lastBroadcastTime < BROADCAST_THROTTLE_MS) {
+    log('debug', `[BROADCAST-THROTTLED] Skipping, last broadcast ${now - lastBroadcastTime}ms ago`);
+    return;
+  }
+  lastBroadcastTime = now;
 
   const message = `data: ${JSON.stringify(data)}\n\n`;
   const toRemove = [];
@@ -336,12 +705,14 @@ function broadcastUpdate(data) {
         res.write(message);
       }
     } catch (err) {
-      log('debug', 'Failed to write to SSE client:', err && err.message ? err.message : err);
+      log('debug', 'Failed to write to SSE client:', err.message);
       toRemove.push(res);
     }
   }
 
   toRemove.forEach(client => sseClients.delete(client));
+  
+  log('debug', `[BROADCAST] Sent to ${sseClients.size} clients, removed ${toRemove.length} dead connections`);
 }
 
 // Database utilities
@@ -410,53 +781,34 @@ function isItemViewed(item, viewedPosts, viewedReels, treatAsReel = false) {
   );
 }
 
-async function getAllDataForBroadcast() {
-  const allSlots = await db.collection('user_slots').find({}).toArray();
-
-  const byUser = {};
-  let totalPosts = 0, totalReels = 0, totalSlots = 0;
-
-  allSlots.forEach(slot => {
-    if (!byUser[slot.userId]) byUser[slot.userId] = {};
-    byUser[slot.userId][slot.slotIndex] = slot;
-    totalPosts += Number(slot.postCount || 0);
-    totalReels += Number(slot.reelCount || 0);
-    totalSlots++;
-  });
-
-  const hierarchical = {
-    users_posts: {},
-    metadata: {
-      totalUsers: Object.keys(byUser).length,
-      totalSlots,
-      totalPosts,
-      totalReels,
-      lastUpdated: new Date().toISOString()
-    }
-  };
-
-  for (const [userId, slots] of Object.entries(byUser)) {
-    hierarchical.users_posts[userId] = { user_post: {} };
-    for (const [slotIndex, doc] of Object.entries(slots)) {
-      hierarchical.users_posts[userId].user_post[`${userId}_${slotIndex}`] = doc;
-    }
-  }
-
-  let contributed = [];
+async function streamUserSlotsSummary(limit = 100, skip = 0) {
   try {
-    contributed = await db.collection('contributed_views_following').find({}).limit(500).toArray();
-  } catch (error) {
-    log('warn', 'Could not fetch contributed_views_following:', error && error.message ? error.message : error);
-  }
+    const slots = await trackedFind(
+      'user_slots',
+      {},
+      {
+        projection: {
+          userId: 1,
+          slotIndex: 1,
+          postCount: 1,
+          reelCount: 1,
+          updatedAt: 1
+        },
+        limit,
+        skip,
+        sort: { updatedAt: -1 }
+      }
+    );
 
-  return {
-    hierarchical,
-    contributed_following: {
-      count: contributed.length,
-      items: contributed,
-      fetchedAt: new Date().toISOString()
-    }
-  };
+    return {
+      slots,
+      count: slots.length,
+      hasMore: slots.length === limit
+    };
+  } catch (error) {
+    log('error', 'Error streaming user slots:', error.message);
+    return { slots: [], count: 0, hasMore: false };
+  }
 }
 
 // Async broadcast helper
@@ -471,7 +823,56 @@ const asyncBroadcast = () => {
   });
 };
 
-// GET comment count for a specific post
+
+
+
+// Add metrics endpoint
+app.get('/api/metrics', (req, res) => {
+  const mongoStats = mongoMetrics.getStats();
+  const slowQueries = mongoMetrics.getSlowQueries();
+  
+  const avgResponseTime = requestStats.responseTimeCount > 0
+    ? (requestStats.responseTimeSum / requestStats.responseTimeCount).toFixed(2)
+    : 0;
+
+  // Calculate top endpoints by request count
+  const topEndpoints = Object.entries(requestStats.byEndpoint)
+    .map(([endpoint, stats]) => ({
+      endpoint,
+      count: stats.count,
+      avgTime: (stats.totalTime / stats.count).toFixed(2) + 'ms'
+    }))
+    .sort((a, b) => b.count - a.count)
+    .slice(0, 10);
+
+  res.json({
+    server: {
+      totalRequests,
+      activeRequests,
+      avgResponseTime: avgResponseTime + 'ms',
+      requestsByMethod: requestStats.byMethod,
+      topEndpoints,
+      uptime: process.uptime() + 's',
+      memoryUsage: {
+        rss: (process.memoryUsage().rss / 1024 / 1024).toFixed(2) + ' MB',
+        heapUsed: (process.memoryUsage().heapUsed / 1024 / 1024).toFixed(2) + ' MB',
+        heapTotal: (process.memoryUsage().heapTotal / 1024 / 1024).toFixed(2) + ' MB'
+      }
+    },
+    mongodb: mongoStats,
+    slowQueries: slowQueries,
+    sseClients: sseClients.size,
+    timestamp: new Date().toISOString()
+  });
+});
+
+// Periodic metrics logging (every 5 minutes)
+setInterval(() => {
+  const stats = mongoMetrics.getStats();
+  log('info', `[METRICS-SNAPSHOT] Reads: ${stats.totalReads}, Writes: ${stats.totalWrites}, Efficiency: ${stats.efficiency}, SlowQueries: ${stats.slowQueriesCount}, Requests: ${totalRequests}, Active: ${activeRequests}`);
+}, 5 * 60 * 1000);
+
+
 app.get('/api/posts/comment-count/:postId', async (req, res) => {
   try {
     const { postId } = req.params;
@@ -482,22 +883,37 @@ app.get('/api/posts/comment-count/:postId', async (req, res) => {
 
     log('debug', `[GET-COMMENT-COUNT] Fetching for ${postId}`);
 
-    const existingSlot = await db.collection('user_slots').findOne({
-      $or: [
-        { 'postList.postId': postId },
-        { 'reelsList.postId': postId }
-      ]
-    }, {
-      projection: { postList: 1, reelsList: 1 }
-    });
+    // Option 1: Get from user_slots (faster with proper index)
+    const existingSlot = await trackedFindOne('user_slots',
+      {
+        $or: [
+          { 'postList.postId': postId },
+          { 'reelsList.postId': postId }
+        ]
+      },
+      {
+        projection: { 
+          'postList.$': 1, 
+          'reelsList.$': 1 
+        }
+      }
+    );
 
     if (!existingSlot) {
-      log('warn', `[GET-COMMENT-COUNT] Post not found: ${postId}`);
+      // Option 2: Fallback to counting comments collection
+      const commentCount = await trackedCountDocuments('comments', { 
+        postId,
+        parentId: null // Only top-level comments
+      });
+
+      log('info', `[GET-COMMENT-COUNT-FALLBACK] ${postId} -> ${commentCount} (from comments collection)`);
+
       return res.json({
         success: true,
-        commentCount: 0,
+        commentCount,
         postId,
-        found: false
+        found: false,
+        source: 'comments_collection'
       });
     }
 
@@ -526,7 +942,8 @@ app.get('/api/posts/comment-count/:postId', async (req, res) => {
       success: true,
       commentCount,
       postId,
-      found
+      found,
+      source: 'user_slots'
     });
 
   } catch (error) {
@@ -534,6 +951,7 @@ app.get('/api/posts/comment-count/:postId', async (req, res) => {
     return res.status(500).json({ error: 'Failed to get comment count' });
   }
 });
+
 
 app.get("/health", (req, res) => {
   res.status(200).send("OK");
@@ -641,6 +1059,9 @@ app.post('/api/posts/record-retention', writeLimit, async (req, res) => {
   }
 });
 
+
+
+
 app.post('/api/posts/toggle-like', writeLimit, async (req, res) => {
   try {
     const { userId, postId, isReel, currentlyLiked } = req.body;
@@ -654,147 +1075,115 @@ app.post('/api/posts/toggle-like', writeLimit, async (req, res) => {
     const cleanUserId = validate.sanitize(userId);
     const action = currentlyLiked ? 'unlike' : 'like';
 
-    const existingSlot = await db.collection('user_slots').findOne({
-      $or: [
-        { 'postList.postId': postId },
-        { 'reelsList.postId': postId }
-      ]
-    });
-
-    if (!existingSlot) {
-      log('warn', `[LIKE-FALLBACK] Post not found: ${postId}`);
-
-      const existingLike = await db.collection('post_likes').findOne({
-        postId: postId,
-        userId: cleanUserId
-      });
-
-      if (!currentlyLiked && !existingLike) {
-        await db.collection('post_likes').insertOne({
-          postId: postId,
-          userId: cleanUserId,
-          createdAt: new Date().toISOString()
-        });
-      } else if (currentlyLiked && existingLike) {
-        await db.collection('post_likes').deleteOne({
-          postId: postId,
-          userId: cleanUserId
-        });
-      }
-
-      const newLikeCount = await db.collection('post_likes').countDocuments({ postId });
-
-      return res.json({
-        success: true,
-        action,
-        isLiked: !currentlyLiked,
-        likeCount: newLikeCount,
-        message: `Post not found in user_slots`,
-        fallback: true
-      });
-    }
-
-    let arrayField = null;
-    const isInPostList = existingSlot.postList && existingSlot.postList.some(item => item.postId === postId);
-    const isInReelsList = existingSlot.reelsList && existingSlot.reelsList.some(item => item.postId === postId);
-
-    if (isInPostList) {
-      arrayField = 'postList';
-    } else if (isInReelsList) {
-      arrayField = 'reelsList';
-    } else {
-      log('error', `[LIKE-ERROR] Post ${postId} not in any array`);
-      return res.status(500).json({ error: 'Data inconsistency' });
-    }
-
-    const existingLike = await db.collection('post_likes').findOne({
+    // Step 1: Check if like exists
+    const existingLike = await trackedFindOne('post_likes', {
       postId: postId,
       userId: cleanUserId
     });
 
     const hasLiked = !!existingLike;
 
-    if (currentlyLiked && !hasLiked) {
-      const actualCount = await db.collection('post_likes').countDocuments({ postId });
-      log('info', `[STATE-CORRECT] Client thinks liked but isn't - count: ${actualCount}`);
+    // Step 2: Handle state mismatch (client out of sync)
+    if (currentlyLiked !== hasLiked) {
+      // Count likes for accurate state
+      const actualCount = await trackedCountDocuments('post_likes', { postId });
+      
+      log('info', `[STATE-CORRECT] ${cleanUserId} -> ${postId}, server=${hasLiked}, client=${currentlyLiked}, count=${actualCount}`);
+      
       return res.json({
         success: true,
         message: 'State corrected',
-        isLiked: false,
+        isLiked: hasLiked,
         likeCount: actualCount,
-        action: 'unlike'
-      });
-    }
-    if (!currentlyLiked && hasLiked) {
-      const actualCount = await db.collection('post_likes').countDocuments({ postId });
-      log('info', `[STATE-CORRECT] Client thinks not liked but is - count: ${actualCount}`);
-      return res.json({
-        success: true,
-        message: 'State corrected',
-        isLiked: true,
-        likeCount: actualCount,
-        action: 'like'
+        action: hasLiked ? 'like' : 'unlike'
       });
     }
 
+    // Step 3: Perform like/unlike operation
+    let newLikeCount;
+    
     if (!currentlyLiked) {
-      await db.collection('post_likes').insertOne({
+      // Add like
+      await trackedInsertOne('post_likes', {
         postId: postId,
         userId: cleanUserId,
         createdAt: new Date().toISOString()
       });
+      // Increment count directly instead of counting all
+      newLikeCount = await trackedCountDocuments('post_likes', { postId });
       log('info', `[LIKE-ADDED] ${cleanUserId} liked ${postId}`);
     } else {
-      await db.collection('post_likes').deleteOne({
+      // Remove like
+      await trackedDeleteOne('post_likes', {
         postId: postId,
         userId: cleanUserId
       });
+      // Decrement count directly
+      newLikeCount = await trackedCountDocuments('post_likes', { postId });
       log('info', `[LIKE-REMOVED] ${cleanUserId} unliked ${postId}`);
     }
 
-    const newLikeCount = await db.collection('post_likes').countDocuments({ postId });
-
     log('info', `[LIKE-COUNT-POST] ${postId} now has ${newLikeCount} likes`);
 
-    await db.collection('user_slots').updateOne(
-      { [`${arrayField}.postId`]: postId },
-      {
-        $set: {
-          [`${arrayField}.$.likeCount`]: newLikeCount,
-          'updatedAt': new Date().toISOString()
-        }
+    // Step 4: Update the count in user_slots (async, non-blocking)
+    // Use updateMany to handle cases where post might be in multiple slots
+    const arrayField = isReel ? 'reelsList' : 'postList';
+    
+    setImmediate(async () => {
+      try {
+        const updateResult = await trackedUpdateOne('user_slots',
+          { [`${arrayField}.postId`]: postId },
+          {
+            $set: {
+              [`${arrayField}.$.likeCount`]: newLikeCount,
+              'updatedAt': new Date().toISOString()
+            }
+          }
+        );
+        
+           if (updateResult.matchedCount > 0) {
+      // Fetch updated post data for sync
+      const updatedSlot = await trackedFindOne('user_slots',
+        { [`${arrayField}.postId`]: postId },
+        { projection: { [`${arrayField}.$`]: 1 } }
+      );
+
+      const postData = updatedSlot?.[arrayField]?.[0];
+      
+      if (postData) {
+        trackChange(postId, {
+          likeCount: newLikeCount,
+          commentCount: postData.commentCount || 0,
+          viewCount: postData.viewCount || 0,
+          retention: postData.retention || 0
+        }, arrayField === 'reelsList');
       }
-    );
-
-    log('info', `[LIKE-SUCCESS] ${action}: ${cleanUserId} -> ${postId}, count: ${newLikeCount}`);
-
-    // Track change for batch sync
-    trackChange(postId, {
-      likeCount: newLikeCount,
-      commentCount: existingSlot?.[arrayField]?.find(p => p.postId === postId)?.commentCount || 0,
-      viewCount: existingSlot?.[arrayField]?.find(p => p.postId === postId)?.viewCount || 0,
-      retention: existingSlot?.[arrayField]?.find(p => p.postId === postId)?.retention || 0
-    }, arrayField === 'reelsList');
+    }
 
     asyncBroadcast();
-
-    res.json({
-      success: true,
-      action,
-      isLiked: !currentlyLiked,
-      likeCount: newLikeCount,
-      message: `Successfully ${action}d`,
-      foundIn: arrayField
-    });
-
   } catch (error) {
-    log('error', '[TOGGLE-LIKE-ERROR]', error.message, error.stack);
-    res.status(500).json({
-      error: 'Internal server error',
-      details: error.message
-    });
+    log('error', `[LIKE-UPDATE-ASYNC-ERROR] ${postId}:`, error.message);
   }
 });
+
+// Step 5: Return immediately
+res.json({
+  success: true,
+  action,
+  isLiked: !currentlyLiked,
+  likeCount: newLikeCount,
+  message: `Successfully ${action}d`,
+  foundIn: arrayField
+});
+} catch (error) {
+log('error', '[TOGGLE-LIKE-ERROR]', error.message, error.stack);
+res.status(500).json({
+error: 'Internal server error',
+details: error.message
+});
+}
+});
+
 
 app.post('/api/posts/increment-view', writeLimit, async (req, res) => {
   try {
@@ -1475,7 +1864,6 @@ app.post('/api/posts', writeLimit, async (req, res) => {
         _id: `${cleanUserId}_${targetIndex}`,
         userId: cleanUserId,
         slotIndex: targetIndex,
-        index: targetIndex,
         postCount: 0,
         reelCount: 0,
         postList: [],
@@ -1527,22 +1915,33 @@ app.post('/api/posts', writeLimit, async (req, res) => {
   }
 });
 
+
+
 app.get('/api/content/user/:uid', async (req, res) => {
   try {
     const { uid } = req.params;
+    const page = parseInt(req.query.page) || 1;
+    const limit = Math.min(parseInt(req.query.limit) || 20, 100);
+    const contentType = req.query.type || 'all'; // 'posts', 'reels', or 'all'
 
     if (!uid || typeof uid !== 'string' || uid.trim().length === 0) {
       return res.status(400).json({ success: false, error: 'Invalid UID' });
     }
 
     const cleanUserId = uid.trim();
+    const skip = (page - 1) * limit;
 
-    log('info', `[GET-USER-CONTENT] Fetching content for userId: ${cleanUserId}`);
+    log('info', `[GET-USER-CONTENT] userId: ${cleanUserId}, page: ${page}, limit: ${limit}, type: ${contentType}`);
 
-    const userSlots = await db.collection('user_slots')
-      .find({ userId: cleanUserId })
-      .sort({ slotIndex: 1 })
-      .toArray();
+    // Fetch only required slots with pagination
+    const userSlots = await trackedFind('user_slots',
+      { userId: cleanUserId },
+      {
+        sort: { updatedAt: -1 },
+        limit: Math.ceil(limit / 50), // Estimate slots needed (assuming ~50 posts per slot)
+        skip: Math.floor(skip / 50)
+      }
+    );
 
     if (!userSlots || userSlots.length === 0) {
       log('warn', `[GET-USER-CONTENT] No slots found for userId: ${cleanUserId}`);
@@ -1551,123 +1950,120 @@ app.get('/api/content/user/:uid', async (req, res) => {
         posts: [],
         reels: [],
         totalPosts: 0,
-        totalReels: 0
+        totalReels: 0,
+        page,
+        hasMore: false
       });
     }
-
-    log('info', `[GET-USER-CONTENT] Found ${userSlots.length} slots for userId: ${cleanUserId}`);
 
     const posts = [];
     const reels = [];
 
-    userSlots.forEach((slot, slotIdx) => {
-      log('debug', `[GET-USER-CONTENT] Processing slot ${slotIdx}: postList=${slot.postList?.length || 0}, reelsList=${slot.reelsList?.length || 0}`);
-
-      if (Array.isArray(slot.postList) && slot.postList.length > 0) {
-        slot.postList.forEach((post, postIdx) => {
-          log('debug', `[GET-USER-CONTENT] Adding post ${postIdx}: ${post.postId}, imageUrl: ${post.imageUrl?.substring(0, 50)}..., multiple_posts: ${post.multiple_posts}`);
-
-          posts.push({
-            postId: post.postId || post.id,
-            userId: cleanUserId,
-            imageUrl: post.imageUrl || '',
-
-            multiple_posts: post.multiple_posts || false,
-            media_count: post.media_count || 0,
-
-            imageUrl1: post.imageUrl1 || post.imageUrl || null,
-            imageUrl2: post.imageUrl2 || null,
-            imageUrl3: post.imageUrl3 || null,
-            imageUrl4: post.imageUrl4 || null,
-            imageUrl5: post.imageUrl5 || null,
-            imageUrl6: post.imageUrl6 || null,
-            imageUrl7: post.imageUrl7 || null,
-            imageUrl8: post.imageUrl8 || null,
-            imageUrl9: post.imageUrl9 || null,
-            imageUrl10: post.imageUrl10 || null,
-            imageUrl11: post.imageUrl11 || null,
-            imageUrl12: post.imageUrl12 || null,
-            imageUrl13: post.imageUrl13 || null,
-            imageUrl14: post.imageUrl14 || null,
-            imageUrl15: post.imageUrl15 || null,
-            imageUrl16: post.imageUrl16 || null,
-            imageUrl17: post.imageUrl17 || null,
-            imageUrl18: post.imageUrl18 || null,
-            imageUrl19: post.imageUrl19 || null,
-            imageUrl20: post.imageUrl20 || null,
-
-            caption: post.caption || '',
-            description: post.description || '',
-            likeCount: post.likeCount || 0,
-            commentCount: post.commentCount || 0,
-            viewCount: post.viewCount || 0,
-            retention: post.retention || 0,
-            timestamp: post.timestamp || new Date().toISOString(),
-            ratio: post.ratio || '4:5',
-            rankingScore: calculateRankingScore({
-              retention: post.retention || 0,
+    userSlots.forEach(slot => {
+      if (contentType === 'all' || contentType === 'posts') {
+        if (Array.isArray(slot.postList) && slot.postList.length > 0) {
+          slot.postList.forEach(post => {
+            posts.push({
+              postId: post.postId || post.id,
+              userId: cleanUserId,
+              imageUrl: post.imageUrl || '',
+              multiple_posts: post.multiple_posts || false,
+              media_count: post.media_count || 0,
+              imageUrl1: post.imageUrl1 || post.imageUrl || null,
+              imageUrl2: post.imageUrl2 || null,
+              imageUrl3: post.imageUrl3 || null,
+              imageUrl4: post.imageUrl4 || null,
+              imageUrl5: post.imageUrl5 || null,
+              imageUrl6: post.imageUrl6 || null,
+              imageUrl7: post.imageUrl7 || null,
+              imageUrl8: post.imageUrl8 || null,
+              imageUrl9: post.imageUrl9 || null,
+              imageUrl10: post.imageUrl10 || null,
+              imageUrl11: post.imageUrl11 || null,
+              imageUrl12: post.imageUrl12 || null,
+              imageUrl13: post.imageUrl13 || null,
+              imageUrl14: post.imageUrl14 || null,
+              imageUrl15: post.imageUrl15 || null,
+              imageUrl16: post.imageUrl16 || null,
+              imageUrl17: post.imageUrl17 || null,
+              imageUrl18: post.imageUrl18 || null,
+              imageUrl19: post.imageUrl19 || null,
+              imageUrl20: post.imageUrl20 || null,
+              caption: post.caption || '',
+              description: post.description || '',
               likeCount: post.likeCount || 0,
               commentCount: post.commentCount || 0,
-              viewCount: post.viewCount || 0
-            })
+              viewCount: post.viewCount || 0,
+              retention: post.retention || 0,
+              timestamp: post.timestamp || new Date().toISOString(),
+              ratio: post.ratio || '4:5',
+              rankingScore: calculateRankingScore({
+                retention: post.retention || 0,
+                likeCount: post.likeCount || 0,
+                commentCount: post.commentCount || 0,
+                viewCount: post.viewCount || 0
+              })
+            });
           });
-        });
+        }
       }
 
-      if (Array.isArray(slot.reelsList) && slot.reelsList.length > 0) {
-        log('info', `[GET-USER-CONTENT] Processing ${slot.reelsList.length} reels from slot ${slotIdx}`);
+      if (contentType === 'all' || contentType === 'reels') {
+        if (Array.isArray(slot.reelsList) && slot.reelsList.length > 0) {
+          slot.reelsList.forEach(reel => {
+            let actualPostId = reel.postId || reel.reelId || reel.id;
 
-        slot.reelsList.forEach((reel, reelIdx) => {
-          let actualPostId = reel.postId || reel.reelId || reel.id;
+            if (actualPostId && actualPostId.includes('_reel_')) {
+              const reelIndex = actualPostId.indexOf('_reel_');
+              actualPostId = actualPostId.substring(0, reelIndex);
+            }
 
-          if (actualPostId && actualPostId.includes('_reel_')) {
-            const reelIndex = actualPostId.indexOf('_reel_');
-            actualPostId = actualPostId.substring(0, reelIndex);
-          }
-
-          log('debug', `[GET-USER-CONTENT] Adding reel ${reelIdx}: reelId=${reel.reelId}, postId=${actualPostId}, videoUrl: ${reel.videoUrl?.substring(0, 50)}..., imageUrl: ${reel.imageUrl?.substring(0, 50)}...`);
-
-          reels.push({
-            postId: actualPostId,
-            reelId: reel.reelId || actualPostId,
-            userId: cleanUserId,
-            imageUrl: reel.imageUrl || '',
-            videoUrl: reel.videoUrl || '',
-            caption: reel.caption || '',
-            description: reel.description || '',
-            likeCount: reel.likeCount || 0,
-            commentCount: reel.commentCount || 0,
-            viewCount: reel.viewCount || 0,
-            retention: reel.retention || 0,
-            timestamp: reel.timestamp || new Date().toISOString(),
-            ratio: reel.ratio || '9:16',
-            rankingScore: calculateRankingScore({
-              retention: reel.retention || 0,
+            reels.push({
+              postId: actualPostId,
+              reelId: reel.reelId || actualPostId,
+              userId: cleanUserId,
+              imageUrl: reel.imageUrl || '',
+              videoUrl: reel.videoUrl || '',
+              caption: reel.caption || '',
+              description: reel.description || '',
               likeCount: reel.likeCount || 0,
               commentCount: reel.commentCount || 0,
-              viewCount: reel.viewCount || 0
-            })
+              viewCount: reel.viewCount || 0,
+              retention: reel.retention || 0,
+              timestamp: reel.timestamp || new Date().toISOString(),
+              ratio: reel.ratio || '9:16',
+              rankingScore: calculateRankingScore({
+                retention: reel.retention || 0,
+                likeCount: reel.likeCount || 0,
+                commentCount: reel.commentCount || 0,
+                viewCount: reel.viewCount || 0
+              })
+            });
           });
-        });
-
-        log('info', `[GET-USER-CONTENT] Added ${slot.reelsList.length} reels from slot ${slotIdx}. Total reels now: ${reels.length}`);
-      } else {
-        log('debug', `[GET-USER-CONTENT] Slot ${slotIdx} has no reels or empty reelsList`);
+        }
       }
     });
 
+    // Sort by ranking score
     posts.sort((a, b) => b.rankingScore - a.rankingScore);
     reels.sort((a, b) => b.rankingScore - a.rankingScore);
 
-    log('info', `[GET-USER-CONTENT] Returning for ${cleanUserId}: ${posts.length} posts, ${reels.length} reels`);
+    // Apply pagination to results
+    const paginatedPosts = posts.slice(0, limit);
+    const paginatedReels = reels.slice(0, limit);
+
+    log('info', `[GET-USER-CONTENT] Returning for ${cleanUserId}: ${paginatedPosts.length} posts, ${paginatedReels.length} reels (page ${page})`);
 
     res.status(200).json({
       success: true,
-      posts,
-      reels,
-      totalPosts: posts.length,
-      totalReels: reels.length,
-      userId: cleanUserId
+      posts: paginatedPosts,
+      reels: paginatedReels,
+      totalPosts: paginatedPosts.length,
+      totalReels: paginatedReels.length,
+      userId: cleanUserId,
+      page,
+      limit,
+      hasMore: posts.length > limit || reels.length > limit
     });
 
   } catch (err) {
@@ -1675,6 +2071,9 @@ app.get('/api/content/user/:uid', async (req, res) => {
     res.status(500).json({ success: false, error: 'Internal server error' });
   }
 });
+
+
+
 
 function calculateRankingScore(metrics) {
   const RETENTION_WEIGHT = 100;
@@ -1690,14 +2089,6 @@ function calculateRankingScore(metrics) {
   );
 }
 
-function extractCleanPostId(postId) {
-  if (!postId) return null;
-  const reelIndex = postId.indexOf('_reel_');
-  if (reelIndex > 0) {
-    return postId.substring(0, reelIndex);
-  }
-  return postId;
-}
 
 app.get('/api/posts/user/:uid', async (req, res) => {
   try {
@@ -1764,6 +2155,8 @@ app.get('/api/posts/user/:uid', async (req, res) => {
   }
 });
 
+
+
 const processFollowingContent = async (userIds, viewerId, req, res) => {
   try {
     if (!Array.isArray(userIds) || userIds.length === 0) {
@@ -1779,29 +2172,49 @@ const processFollowingContent = async (userIds, viewerId, req, res) => {
       return res.status(400).json({ error: 'No valid userIds provided' });
     }
 
+    const page = parseInt(req.query?.page) || 1;
+    const limit = Math.min(parseInt(req.query?.limit) || 20, 100);
+    const skip = (page - 1) * limit;
+
     const cleanViewerId = viewerId ? validate.sanitize(viewerId) : null;
-    const { viewedPosts, viewedReels } = await fetchViewerViewedSets(cleanViewerId);
+    
+    log('info', `[BATCH-FOLLOWING] ${cleanUserIds.length} users, viewer: ${cleanViewerId || 'none'}, page: ${page}`);
+
+    // Fetch viewer's viewed content in parallel
+    const viewedSetsPromise = cleanViewerId 
+      ? fetchViewerViewedSets(cleanViewerId)
+      : Promise.resolve({ viewedPosts: new Set(), viewedReels: new Set() });
+
+    // Fetch user slots with projection to minimize data transfer
+    const slotsPromise = trackedFind('user_slots',
+      { userId: { $in: cleanUserIds } },
+      {
+        projection: {
+          userId: 1,
+          slotIndex: 1,
+          postList: 1,
+          reelsList: 1,
+          updatedAt: 1
+        },
+        sort: { updatedAt: -1 },
+        limit: Math.ceil(limit / 10) * cleanUserIds.length // Estimate slots needed
+      }
+    );
+
+    const [{ viewedPosts, viewedReels }, slots] = await Promise.all([
+      viewedSetsPromise,
+      slotsPromise
+    ]);
+
+    log('info', `[BATCH-FOLLOWING] Found ${slots.length} user slots`);
 
     const content = [];
-    const allPosts = [];
-    const allReels = [];
     let filteredOut = 0;
-    const userStats = {};
-
-    const slots = await db.collection('user_slots')
-      .find({ userId: { $in: cleanUserIds } })
-      .toArray();
-
-    log('info', `[BATCH-FOLLOWING] Found ${slots.length} user slots for ${cleanUserIds.length} users`);
 
     slots.forEach(slot => {
       const uid = slot.userId;
       const slotIndex = slot.slotIndex;
       const docName = `${uid}_${slotIndex}`;
-
-      if (!userStats[uid]) {
-        userStats[uid] = { posts: 0, reels: 0, latestPostTime: null, latestReelTime: null };
-      }
 
       if (Array.isArray(slot.postList)) {
         slot.postList.forEach(post => {
@@ -1811,7 +2224,7 @@ const processFollowingContent = async (userIds, viewerId, req, res) => {
               return;
             }
 
-            const processedPost = {
+            content.push({
               ...post,
               postId: post.postId || post.id,
               sourceDocument: docName,
@@ -1822,16 +2235,7 @@ const processFollowingContent = async (userIds, viewerId, req, res) => {
               slotIndex,
               fetchedAt: new Date().toISOString(),
               userId: uid
-            };
-
-            content.push(processedPost);
-            allPosts.push(processedPost);
-            userStats[uid].posts++;
-
-            const timestamp = new Date(post.timestamp || post.savedAt || 0);
-            if (!userStats[uid].latestPostTime || timestamp > userStats[uid].latestPostTime) {
-              userStats[uid].latestPostTime = timestamp;
-            }
+            });
           } catch (error) {
             log('error', `[POST-PROCESS-ERROR] ${error.message}`);
           }
@@ -1848,7 +2252,7 @@ const processFollowingContent = async (userIds, viewerId, req, res) => {
 
             let actualPostId = reel.postId || reel.reelId || reel.id;
 
-            const processedReel = {
+            content.push({
               ...reel,
               postId: actualPostId,
               reelId: reel.reelId || actualPostId,
@@ -1860,16 +2264,7 @@ const processFollowingContent = async (userIds, viewerId, req, res) => {
               slotIndex,
               fetchedAt: new Date().toISOString(),
               userId: uid
-            };
-
-            content.push(processedReel);
-            allReels.push(processedReel);
-            userStats[uid].reels++;
-
-            const timestamp = new Date(reel.timestamp || reel.savedAt || 0);
-            if (!userStats[uid].latestReelTime || timestamp > userStats[uid].latestReelTime) {
-              userStats[uid].latestReelTime = timestamp;
-            }
+            });
           } catch (error) {
             log('error', `[REEL-PROCESS-ERROR] ${error.message}`);
           }
@@ -1877,13 +2272,11 @@ const processFollowingContent = async (userIds, viewerId, req, res) => {
       }
     });
 
-    const sortByEngagement = req.url && req.url.includes('/batch-following');
+    // Sort by engagement
     content.sort((a, b) => {
-      if (sortByEngagement) {
-        const engagementA = (a.likeCount || 0) * 2 + (a.commentCount || 0) * 3;
-        const engagementB = (b.likeCount || 0) * 2 + (b.commentCount || 0) * 3;
-        if (engagementA !== engagementB) return engagementB - engagementA;
-      }
+      const engagementA = (a.likeCount || 0) * 2 + (a.commentCount || 0) * 3;
+      const engagementB = (b.likeCount || 0) * 2 + (b.commentCount || 0) * 3;
+      if (engagementA !== engagementB) return engagementB - engagementA;
 
       try {
         const dateA = new Date(a.timestamp || a.savedAt || 0);
@@ -1894,7 +2287,13 @@ const processFollowingContent = async (userIds, viewerId, req, res) => {
       }
     });
 
-    const baseResponse = {
+    // Apply pagination
+    const paginatedContent = content.slice(skip, skip + limit);
+    const hasMore = content.length > (skip + limit);
+
+    log('info', `[BATCH-FOLLOWING] Returning ${paginatedContent.length} items (page ${page}, total ${content.length})`);
+
+    return res.json({
       success: true,
       viewerId: cleanViewerId,
       filteredOut,
@@ -1902,22 +2301,14 @@ const processFollowingContent = async (userIds, viewerId, req, res) => {
         posts: viewedPosts.size,
         reels: viewedReels.size
       },
-      timestamp: new Date().toISOString()
-    };
-
-    log('info', `[BATCH-FOLLOWING] Returning ${content.length} items (${allPosts.length} posts, ${allReels.length} reels)`);
-
-    return res.json({
-      ...baseResponse,
       requestedUsers: cleanUserIds,
-      content,
-      totalItems: content.length,
+      content: paginatedContent,
+      totalItems: paginatedContent.length,
       userCount: cleanUserIds.length,
-      stats: {
-        posts: allPosts.length,
-        reels: allReels.length,
-        filteredOut
-      }
+      page,
+      limit,
+      hasMore,
+      timestamp: new Date().toISOString()
     });
 
   } catch (error) {
@@ -1927,11 +2318,15 @@ const processFollowingContent = async (userIds, viewerId, req, res) => {
       success: true,
       content: [],
       totalItems: 0,
+      page: 1,
+      hasMore: false,
       message: 'Error processing content',
       error: error.message
     });
   }
 };
+
+
 
 app.get('/api/posts/following/:userId', async (req, res) => {
   const { userId } = req.params;
@@ -2004,15 +2399,36 @@ app.get('/api/posts/following', async (req, res) => {
 
 app.get('/api/posts/all', async (req, res) => {
   try {
-    const data = await getAllDataForBroadcast();
-    res.json(data);
+    const page = parseInt(req.query.page) || 1;
+    const limit = Math.min(parseInt(req.query.limit) || 50, 100); // Max 100 per page
+    const skip = (page - 1) * limit;
+
+    const data = await streamUserSlotsSummary(limit, skip);
+    
+    res.json({
+      success: true,
+      page,
+      limit,
+      count: data.count,
+      hasMore: data.hasMore,
+      slots: data.slots,
+      timestamp: new Date().toISOString()
+    });
   } catch (error) {
-    log('error', 'Get all posts error:', error && error.message ? error.message : error);
+    log('error', 'Get all posts error:', error.message);
     res.status(500).json({ error: 'Internal server error' });
   }
 });
 
 app.get('/api/posts/stream', (req, res) => {
+  // Check client limit
+  if (sseClients.size >= MAX_SSE_CLIENTS) {
+    return res.status(503).json({ 
+      error: 'Maximum SSE connections reached',
+      limit: MAX_SSE_CLIENTS 
+    });
+  }
+
   res.writeHead(200, {
     'Content-Type': 'text/event-stream',
     'Cache-Control': 'no-cache',
@@ -2022,28 +2438,25 @@ app.get('/api/posts/stream', (req, res) => {
   });
 
   sseClients.add(res);
-  log('debug', 'New SSE client connected. Total clients:', sseClients.size);
+  log('debug', `New SSE client connected. Total: ${sseClients.size}/${MAX_SSE_CLIENTS}`);
 
-  getAllDataForBroadcast()
+  // Send lightweight summary instead of all data
+  streamUserSlotsSummary(50, 0)
     .then(data => {
       try {
         if (!res.writableEnded && !res.destroyed) {
-          res.write(`data: ${JSON.stringify(data)}\n\n`);
+          res.write(`data: ${JSON.stringify({
+            type: 'summary',
+            totalSlots: data.count,
+            timestamp: new Date().toISOString()
+          })}\n\n`);
         }
       } catch (error) {
-        log('debug', 'Failed to send initial SSE data:', error && error.message ? error.message : error);
         sseClients.delete(res);
       }
     })
     .catch(error => {
-      log('error', 'Error sending initial SSE data:', error && error.message ? error.message : error);
-      try {
-        if (!res.writableEnded && !res.destroyed) {
-          res.write(`data: ${JSON.stringify({ error: 'Failed to load initial data' })}\n\n`);
-        }
-      } catch {
-        sseClients.delete(res);
-      }
+      log('error', 'Error sending initial SSE data:', error.message);
     });
 
   const pingInterval = setInterval(() => {
@@ -2067,11 +2480,13 @@ app.get('/api/posts/stream', (req, res) => {
   });
 
   req.on('error', (error) => {
-    log('debug', 'SSE client error:', error && error.message ? error.message : error);
+    log('debug', 'SSE client error:', error.message);
     sseClients.delete(res);
     clearInterval(pingInterval);
   });
 });
+
+
 
 app.get('/api/posts/get-like-count/:postId', async (req, res) => {
   try {
@@ -2081,9 +2496,25 @@ app.get('/api/posts/get-like-count/:postId', async (req, res) => {
       return res.status(400).json({ error: 'postId required' });
     }
 
+    // Check cache first
+    const cached = likeCountCache.get(postId);
+    if (cached !== null) {
+      log('debug', `[GET-COUNT-CACHED] ${postId} -> ${cached}`);
+      return res.json({
+        success: true,
+        likeCount: cached,
+        postId,
+        found: true,
+        cached: true
+      });
+    }
+
     log('debug', `[GET-COUNT] ${postId}`);
 
-    const likeCount = await db.collection('post_likes').countDocuments({ postId });
+    const likeCount = await trackedCountDocuments('post_likes', { postId });
+
+    // Store in cache
+    likeCountCache.set(postId, likeCount);
 
     log('info', `[GET-COUNT] ${postId} -> ${likeCount}`);
 
@@ -2091,7 +2522,8 @@ app.get('/api/posts/get-like-count/:postId', async (req, res) => {
       success: true,
       likeCount,
       postId,
-      found: true
+      found: true,
+      cached: false
     });
 
   } catch (error) {
@@ -2099,6 +2531,11 @@ app.get('/api/posts/get-like-count/:postId', async (req, res) => {
     return res.status(500).json({ error: 'Failed to get count' });
   }
 });
+
+// Invalidate cache on like toggle
+// Add after successful like/unlike in toggle-like endpoint:
+likeCountCache.delete(postId);
+
 
 app.post('/api/posts/batch-check-liked', async (req, res) => {
   try {
@@ -2108,33 +2545,44 @@ app.post('/api/posts/batch-check-liked', async (req, res) => {
       return res.status(400).json({ error: 'userId and postIds array required' });
     }
 
-    log('debug', `[BATCH-CHECK] ${userId} checking ${postIds.length} posts`);
+    // Limit batch size
+    const limitedPostIds = postIds.slice(0, 100);
+    
+    if (postIds.length > 100) {
+      log('warn', `[BATCH-CHECK] Request for ${postIds.length} posts, limited to 100`);
+    }
+
+    log('debug', `[BATCH-CHECK] ${userId} checking ${limitedPostIds.length} posts`);
 
     const cleanUserId = validate.sanitize(userId);
 
-    const likes = await db.collection('post_likes')
-      .find({
-        postId: { $in: postIds },
+    // Use projection to only fetch postId field
+    const likes = await trackedFind('post_likes',
+      {
+        postId: { $in: limitedPostIds },
         userId: cleanUserId
-      })
-      .project({ postId: 1 })
-      .toArray();
+      },
+      {
+        projection: { postId: 1, _id: 0 }
+      }
+    );
 
     const likedPostIds = new Set(likes.map(like => like.postId));
 
     const result = {};
-    postIds.forEach(postId => {
+    limitedPostIds.forEach(postId => {
       result[postId] = {
         isLiked: likedPostIds.has(postId)
       };
     });
 
-    log('info', `[BATCH-CHECK] ${postIds.length} posts, ${likes.length} liked`);
+    log('info', `[BATCH-CHECK] ${limitedPostIds.length} posts, ${likes.length} liked`);
 
     return res.json({
       success: true,
       likes: result,
-      userId
+      userId,
+      checkedCount: limitedPostIds.length
     });
 
   } catch (error) {
@@ -2143,9 +2591,7 @@ app.post('/api/posts/batch-check-liked', async (req, res) => {
   }
 });
 
-app.get('/database-viewer', (req, res) => {
-  res.send(`<!DOCTYPE html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>MongoDB Database Viewer</title><style>body{font-family:system-ui,-apple-system,"Segoe UI",Roboto,Arial,sans-serif;background:#111;color:#eee;margin:0;line-height:1.6}.header{padding:16px;display:flex;justify-content:space-between;align-items:center;background:linear-gradient(90deg,#1e1e2f,#2a2a3a);box-shadow:0 2px 4px rgba(0,0,0,0.3)}.header h1{margin:0;font-size:1.2em}.status{padding:4px 12px;border-radius:16px;font-size:0.9em;font-weight:500}.status.connected{background:#10b981;color:white}.status.loading{background:#f59e0b;color:white}.status.error{background:#ef4444;color:white}.container{padding:16px;height:calc(100vh - 80px);overflow:auto}.controls{margin-bottom:16px;display:flex;gap:12px;flex-wrap:wrap}.btn{padding:8px 16px;background:#374151;border:none;border-radius:6px;color:#fff;cursor:pointer;font-size:0.9em}.btn:hover{background:#4b5563}.btn.active{background:#3b82f6}pre{white-space:pre-wrap;word-wrap:break-word;background:#0b0b0b;padding:16px;border-radius:8px;border:1px solid #374151;font-size:0.9em;max-height:80vh;overflow:auto}.stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:12px;margin-bottom:16px}.stat-card{background:#1f2937;padding:12px;border-radius:8px;border:1px solid #374151}.stat-value{font-size:1.5em;font-weight:bold;color:#10b981}.stat-label{font-size:0.9em;color:#9ca3af}</style></head><body><div class="header"><h1>🍃 MongoDB Database Viewer</h1><div class="status loading" id="status">Loading...</div></div><div class="container"><div class="stats" id="stats"></div><div class="controls"><button class="btn active" id="btn-all" onclick="showData('all')">All Data</button><button class="btn" id="btn-hierarchical" onclick="showData('hierarchical')">User Posts</button><button class="btn" id="btn-contributed" onclick="showData('contributed')">Viewed Content</button><button class="btn" onclick="refreshData()">Refresh</button></div><pre id="payload">Loading...</pre></div><script>let currentData=null;let currentView='all';function updateStats(data){const statsEl=document.getElementById('stats');if(!data||!data.hierarchical||!data.hierarchical.metadata){statsEl.innerHTML='';return}const meta=data.hierarchical.metadata;const contrib=data.contributed_following||{};statsEl.innerHTML=\`<div class="stat-card"><div class="stat-value">\${meta.totalUsers||0}</div><div class="stat-label">Total Users</div></div><div class="stat-card"><div class="stat-value">\${meta.totalPosts||0}</div><div class="stat-label">Total Posts</div></div><div class="stat-card"><div class="stat-value">\${meta.totalReels||0}</div><div class="stat-label">Total Reels</div></div><div class="stat-card"><div class="stat-value">\${contrib.count||0}</div><div class="stat-label">Viewed Records</div></div>\`}function showData(view){currentView=view;document.querySelectorAll('.btn').forEach(btn=>btn.classList.remove('active'));document.getElementById(\`btn-\${view}\`).classList.add('active');if(!currentData)return;const payloadEl=document.getElementById('payload');let displayData;switch(view){case 'hierarchical':displayData=currentData.hierarchical;break;case 'contributed':displayData=currentData.contributed_following;break;default:displayData=currentData}payloadEl.textContent=JSON.stringify(displayData,null,2)}function refreshData(){const statusEl=document.getElementById('status');const payloadEl=document.getElementById('payload');statusEl.textContent='Loading...';statusEl.className='status loading';fetch('/api/posts/all').then(response=>{if(!response.ok)throw new Error(\`HTTP \${response.status}\`);return response.json()}).then(data=>{currentData=data;updateStats(data);showData(currentView);statusEl.textContent='Loaded';statusEl.className='status connected'}).catch(error=>{payloadEl.textContent=\`Failed to load: \${error.message}\`;statusEl.textContent='Error';statusEl.className='status error';console.error('Load error:',error)})}function setupEventSource(){const statusEl=document.getElementById('status');try{const eventSource=new EventSource('/api/posts/stream');eventSource.onopen=function(){statusEl.textContent='Connected';statusEl.className='status connected'};eventSource.onerror=function(){statusEl.textContent='Disconnected';statusEl.className='status error'};eventSource.onmessage=function(event){try{const data=JSON.parse(event.data);currentData=data;updateStats(data);showData(currentView);statusEl.textContent='Connected (Live)';statusEl.className='status connected'}catch(error){console.error('SSE parse error:',error)}};eventSource.addEventListener('error',function(){setTimeout(()=>{if(eventSource.readyState===EventSource.CLOSED){setupEventSource()}},5000)})}catch(error){console.error('EventSource error:',error);refreshData();setInterval(refreshData,10000)}}refreshData();setupEventSource()</script></body></html>`);
-});
+
 
 app.use((err, req, res, next) => {
   log('error', 'Unhandled error:', err && err.message ? err.message : err);
