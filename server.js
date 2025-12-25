@@ -43,7 +43,7 @@ class MongoMetrics {
     this.slowQueries = [];
   }
 
-  trackQuery(operation, duration, docs Examined, docsReturned, query) {
+  trackQuery(operation, duration, docsExamined, docsReturned, query) {
     if (operation.includes('find') || operation.includes('findOne') || operation.includes('count')) {
       this.reads++;
     } else {
