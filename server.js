@@ -657,7 +657,6 @@ async function setupCriticalIndexes() {
 
 
 
-// MongoDB initialization
 async function initMongo() {
   try {
     client = new MongoClient(MONGODB_URI, {
@@ -674,11 +673,149 @@ async function initMongo() {
     await db.admin().ping();
     log('info', 'MongoDB connection established successfully');
 
+    // Existing index creation
     await setupCriticalIndexes();
+    
+    // ✅ ADD THIS: Following feed indexes
+    await createFollowingFeedIndexes();
 
   } catch (error) {
     log('error', 'MongoDB initialization failed:', error && error.message ? error.message : error);
     throw error;
+  }
+}
+
+// ✅ ADD THIS NEW FUNCTION (after setupCriticalIndexes function)
+async function createFollowingFeedIndexes() {
+  try {
+    log('info', '[FOLLOWING-INDEXES] Creating indexes for following feed...');
+    
+    const followingIndexes = [
+      // ===== USER_SLOTS COLLECTION (Following Content Fetch) =====
+      {
+        collection: 'user_slots',
+        indexes: [
+          // Fast user lookup with recency sort
+          { 
+            index: { userId: 1, updatedAt: -1 }, 
+            options: { 
+              name: 'userId_updatedAt_following',
+              background: true 
+            }
+          },
+          
+          // Fast postId lookup in arrays
+          { 
+            index: { userId: 1, 'postList.postId': 1 }, 
+            options: { 
+              name: 'userId_postList_postId_following',
+              background: true,
+              sparse: true 
+            }
+          },
+          
+          { 
+            index: { userId: 1, 'reelsList.postId': 1 }, 
+            options: { 
+              name: 'userId_reelsList_postId_following',
+              background: true,
+              sparse: true 
+            }
+          },
+          
+          // Retention-based sorting for following content
+          { 
+            index: { userId: 1, 'postList.retention': -1 }, 
+            options: { 
+              name: 'userId_postList_retention_following',
+              background: true,
+              sparse: true 
+            }
+          },
+          
+          { 
+            index: { userId: 1, 'reelsList.retention': -1 }, 
+            options: { 
+              name: 'userId_reelsList_retention_following',
+              background: true,
+              sparse: true 
+            }
+          }
+        ]
+      },
+
+      // ===== CONTRIBUTED_VIEWS_FOLLOWING (View Tracking) =====
+      {
+        collection: 'contributed_views_following',
+        indexes: [
+          // Fast user lookup
+          { 
+            index: { userId: 1 }, 
+            options: { 
+              name: 'userId_following_views',
+              background: true 
+            }
+          },
+          
+          // Document-specific lookup
+          { 
+            index: { userId: 1, documentName: 1 }, 
+            options: { 
+              name: 'userId_documentName_following',
+              background: true 
+            }
+          },
+          
+          // Fast array membership checks
+          { 
+            index: { PostList: 1 }, 
+            options: { 
+              name: 'postList_array_following',
+              background: true,
+              sparse: true 
+            }
+          },
+          
+          { 
+            index: { reelsList: 1 }, 
+            options: { 
+              name: 'reelsList_array_following',
+              background: true,
+              sparse: true 
+            }
+          }
+        ]
+      }
+    ];
+
+    let successCount = 0;
+    let skipCount = 0;
+    let errorCount = 0;
+
+    for (const { collection, indexes } of followingIndexes) {
+      for (const { index, options } of indexes) {
+        try {
+          await db.collection(collection).createIndex(index, options);
+          successCount++;
+          log('info', `[FOLLOWING-INDEX] ✓ ${collection}.${options.name}`);
+        } catch (error) {
+          // Silently skip "already exists" errors (code 85 or 86)
+          if (error.code === 85 || error.code === 86 || 
+              error.message?.includes('already exists')) {
+            skipCount++;
+          } else {
+            errorCount++;
+            log('warn', `[FOLLOWING-INDEX] ✗ ${collection}.${options.name}: ${error.message}`);
+          }
+        }
+      }
+    }
+
+    log('info', `[FOLLOWING-INDEXES] ✅ Created: ${successCount} | Existed: ${skipCount} | Errors: ${errorCount}`);
+    
+  } catch (error) {
+    log('error', '[FOLLOWING-INDEXES] Failed to create indexes:', error.message);
+    // Don't throw - allow server to continue with existing indexes
   }
 }
 
