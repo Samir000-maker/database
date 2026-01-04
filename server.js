@@ -2416,33 +2416,6 @@ const processFollowingContent = async (userIds, viewerId, req, res) => {
     }
   });
 }
-
-// And for posts:
-if (Array.isArray(slot.postList)) {
-  slot.postList.forEach(post => {
-    try {
-      if (cleanViewerId && isItemViewed(post, viewedPosts, viewedReels, false)) {
-        filteredOut++;
-        return;
-      }
-
-      content.push({
-        ...post,
-        postId: post.postId || post.id,
-        sourceDocument: docName,
-        documentSlot: slotIndex,
-        followedUserId: uid,
-        contentType: 'following',
-        isReel: false, // ✅ ENSURE THIS IS EXPLICITLY SET
-        slotIndex,
-        fetchedAt: new Date().toISOString(),
-        userId: uid
-      });
-    } catch (error) {
-      log('error', `[POST-PROCESS-ERROR] ${error.message}`);
-    }
-  });
-}
     });
 
     // Sort by engagement
