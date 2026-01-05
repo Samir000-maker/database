@@ -1171,7 +1171,7 @@ app.post('/api/posts/record-retention', writeLimit, async (req, res) => {
   try {
     const { userId, postId, retentionPercent, watchedDuration, totalDuration, isReel } = req.body;
 
-    log('info', `Retention request: ${userId} -> ${postId}, ${retentionPercent}%`);
+    log('info', `[RETENTION] ${userId} -> ${postId}, ${retentionPercent}%`);
 
     if (!validate.userId(userId) || !postId || typeof retentionPercent !== 'number') {
       return res.status(400).json({ error: 'userId, postId, and retentionPercent required' });
@@ -1184,21 +1184,33 @@ app.post('/api/posts/record-retention', writeLimit, async (req, res) => {
     const cleanUserId = validate.sanitize(userId);
     const arrayField = isReel ? 'reelsList' : 'postList';
 
-    const existingRetention = await db.collection('post_retention').findOne({
+    // Check duplicate (single read)
+    const existingRetention = await trackedFindOne('post_retention', {
       postId: postId,
       userId: cleanUserId
     });
 
     if (existingRetention) {
-      log('info', `Retention duplicate blocked: ${cleanUserId} -> ${postId}`);
+      log('info', `[RETENTION-DUPLICATE] ${cleanUserId} -> ${postId}`);
+      
+      // Still return current metrics from slot
+      const slot = await trackedFindOne('user_slots',
+        { [`${arrayField}.postId`]: postId },
+        { projection: { [`${arrayField}.$`]: 1 } }
+      );
+
+      const viewCount = slot?.[arrayField]?.[0]?.viewCount || 0;
+
       return res.json({
         success: true,
         message: 'Retention already contributed',
-        duplicate: true
+        duplicate: true,
+        viewCount
       });
     }
 
-    await db.collection('post_retention').insertOne({
+    // Record retention
+    await trackedInsertOne('post_retention', {
       postId: postId,
       userId: cleanUserId,
       retentionPercent: Math.round(retentionPercent * 100) / 100,
@@ -1207,12 +1219,9 @@ app.post('/api/posts/record-retention', writeLimit, async (req, res) => {
       createdAt: new Date().toISOString()
     });
 
-    log('info', `Retention record added: ${cleanUserId} -> ${postId}`);
-
-    const updateResult = await db.collection('user_slots').updateOne(
-      {
-        [`${arrayField}.postId`]: postId
-      },
+    // ✅ CRITICAL: Update user_slots with change detection (single operation)
+    const result = await trackedUpdateOneWithSync('user_slots',
+      { [`${arrayField}.postId`]: postId },
       {
         $set: {
           [`${arrayField}.$.retention`]: Math.round(retentionPercent * 100) / 100,
@@ -1225,39 +1234,17 @@ app.post('/api/posts/record-retention', writeLimit, async (req, res) => {
       }
     );
 
-    if (updateResult.matchedCount === 0) {
-      log('warn', `Post not found in ANY user slots: ${postId}`);
-      return res.status(404).json({ error: 'Post not found in database' });
+    if (!result.value) {
+      log('warn', `[RETENTION-NOT-FOUND] ${postId}`);
+      return res.status(404).json({ error: 'Post not found' });
     }
 
-    const updatedSlot = await db.collection('user_slots').findOne(
-      { [`${arrayField}.postId`]: postId },
-      { projection: { [`${arrayField}.$`]: 1 } }
-    );
+    const updatedPost = result.value[arrayField]?.find(p => p.postId === postId);
+    const viewCount = updatedPost?.viewCount || 1;
 
-    const viewCount = updatedSlot && updatedSlot[arrayField] && updatedSlot[arrayField][0]
-      ? Math.max(0, updatedSlot[arrayField][0].viewCount || 1)
-      : 1;
+    log('info', `[RETENTION-SUCCESS] ${cleanUserId} -> ${postId}, viewCount: ${viewCount}`);
 
-    log('info', `Retention recorded successfully: ${cleanUserId} -> ${postId}, ${retentionPercent}%, viewCount: ${viewCount}`);
-
-    // ✅ FIXED: Fire-and-forget sync to PORT 2000 (non-blocking)
-const metrics = {
-  likeCount: updatedSlot?.[arrayField]?.[0]?.likeCount || 0,
-  commentCount: updatedSlot?.[arrayField]?.[0]?.commentCount || 0,
-  viewCount,
-  retention: Math.round(retentionPercent * 100) / 100
-};
-
-// Async sync to PORT 2000 (don't block response)
-setImmediate(() => {
-  syncMetricsToPort2000(postId, metrics, isReel).catch(err => {
-    log('warn', `[RETENTION-SYNC-FAILED] ${postId}: ${err.message}`);
-  });
-});
-
-asyncBroadcast();
-
+    // Change already tracked by trackedUpdateOneWithSync
     asyncBroadcast();
 
     res.json({
@@ -1269,7 +1256,7 @@ asyncBroadcast();
     });
 
   } catch (error) {
-    log('error', 'Retention recording error:', error && error.message ? error.message : error);
+    log('error', '[RETENTION-ERROR]', error.message);
     res.status(500).json({ error: 'Internal server error' });
   }
 });
@@ -1281,16 +1268,15 @@ app.post('/api/posts/toggle-like', writeLimit, async (req, res) => {
   try {
     const { userId, postId, isReel, currentlyLiked } = req.body;
 
-    log('info', `[LIKE-REQUEST] ${userId} -> ${postId}, currently: ${currentlyLiked}`);
+    log('info', `[LIKE] ${userId} -> ${postId}, currently: ${currentlyLiked}`);
 
     if (!validate.userId(userId) || !postId) {
       return res.status(400).json({ error: 'userId and postId required' });
     }
 
     const cleanUserId = validate.sanitize(userId);
-    const action = currentlyLiked ? 'unlike' : 'like';
 
-    // Step 1: Check if like exists
+    // Check if like exists (single read)
     const existingLike = await trackedFindOne('post_likes', {
       postId: postId,
       userId: cleanUserId
@@ -1298,12 +1284,11 @@ app.post('/api/posts/toggle-like', writeLimit, async (req, res) => {
 
     const hasLiked = !!existingLike;
 
-    // Step 2: Handle state mismatch (client out of sync)
+    // State mismatch correction
     if (currentlyLiked !== hasLiked) {
-      // Count likes for accurate state
       const actualCount = await trackedCountDocuments('post_likes', { postId });
       
-      log('info', `[STATE-CORRECT] ${cleanUserId} -> ${postId}, server=${hasLiked}, client=${currentlyLiked}, count=${actualCount}`);
+      log('info', `[LIKE-STATE-CORRECT] ${cleanUserId} -> ${postId}, server=${hasLiked}, client=${currentlyLiked}, count=${actualCount}`);
       
       return res.json({
         success: true,
@@ -1314,93 +1299,57 @@ app.post('/api/posts/toggle-like', writeLimit, async (req, res) => {
       });
     }
 
-    // Step 3: Perform like/unlike operation
+    // Perform like/unlike
     let newLikeCount;
     
     if (!currentlyLiked) {
-      // Add like
       await trackedInsertOne('post_likes', {
         postId: postId,
         userId: cleanUserId,
         createdAt: new Date().toISOString()
       });
-      // Increment count directly instead of counting all
       newLikeCount = await trackedCountDocuments('post_likes', { postId });
-      log('info', `[LIKE-ADDED] ${cleanUserId} liked ${postId}`);
+      log('info', `[LIKE-ADDED] ${cleanUserId} -> ${postId}`);
     } else {
-      // Remove like
       await trackedDeleteOne('post_likes', {
         postId: postId,
         userId: cleanUserId
       });
-      // Decrement count directly
       newLikeCount = await trackedCountDocuments('post_likes', { postId });
-      log('info', `[LIKE-REMOVED] ${cleanUserId} unliked ${postId}`);
+      log('info', `[LIKE-REMOVED] ${cleanUserId} -> ${postId}`);
     }
 
-    log('info', `[LIKE-COUNT-POST] ${postId} now has ${newLikeCount} likes`);
-
-    // Step 4: Update the count in user_slots (async, non-blocking)
-    // Use updateMany to handle cases where post might be in multiple slots
+    // ✅ CRITICAL: Update user_slots with change detection (single operation)
     const arrayField = isReel ? 'reelsList' : 'postList';
     
-    setImmediate(async () => {
-      try {
-        const updateResult = await trackedUpdateOne('user_slots',
-          { [`${arrayField}.postId`]: postId },
-          {
-            $set: {
-              [`${arrayField}.$.likeCount`]: newLikeCount,
-              'updatedAt': new Date().toISOString()
-            }
-          }
-        );
-        
-           if (updateResult.matchedCount > 0) {
-      // Fetch updated post data for sync
-      const updatedSlot = await trackedFindOne('user_slots',
-        { [`${arrayField}.postId`]: postId },
-        { projection: { [`${arrayField}.$`]: 1 } }
-      );
-
-      const postData = updatedSlot?.[arrayField]?.[0];
-      
-      if (postData) {
-        trackChange(postId, {
-          likeCount: newLikeCount,
-          commentCount: postData.commentCount || 0,
-          viewCount: postData.viewCount || 0,
-          retention: postData.retention || 0
-        }, arrayField === 'reelsList');
+    await trackedUpdateOneWithSync('user_slots',
+      { [`${arrayField}.postId`]: postId },
+      {
+        $set: {
+          [`${arrayField}.$.likeCount`]: newLikeCount,
+          'updatedAt': new Date().toISOString()
+        }
       }
-    }
+    );
 
-// Invalidate cache on like toggle
-// Add after successful like/unlike in toggle-like endpoint:
+    // Invalidate cache
     likeCountCache.delete(postId);
 
+    // Change already tracked by trackedUpdateOneWithSync
     asyncBroadcast();
-  } catch (error) {
-    log('error', `[LIKE-UPDATE-ASYNC-ERROR] ${postId}:`, error.message);
-  }
-});
 
-// Step 5: Return immediately
-res.json({
-  success: true,
-  action,
-  isLiked: !currentlyLiked,
-  likeCount: newLikeCount,
-  message: `Successfully ${action}d`,
-  foundIn: arrayField
-});
-} catch (error) {
-log('error', '[TOGGLE-LIKE-ERROR]', error.message, error.stack);
-res.status(500).json({
-error: 'Internal server error',
-details: error.message
-});
-}
+    res.json({
+      success: true,
+      action: currentlyLiked ? 'unlike' : 'like',
+      isLiked: !currentlyLiked,
+      likeCount: newLikeCount,
+      message: `Successfully ${currentlyLiked ? 'unliked' : 'liked'}`
+    });
+
+  } catch (error) {
+    log('error', '[LIKE-ERROR]', error.message);
+    res.status(500).json({ error: 'Internal server error' });
+  }
 });
 
 
@@ -1412,27 +1361,26 @@ app.post('/api/posts/increment-view', writeLimit, async (req, res) => {
       return res.status(400).json({ error: 'userId and postId required' });
     }
 
-    log('info', `[VIEW-INCREMENT-MANUAL] ${userId} -> ${postId}`);
+    log('info', `[VIEW] ${userId} -> ${postId}`);
 
     const cleanUserId = validate.sanitize(userId);
     const arrayField = isReel ? 'reelsList' : 'postList';
 
-    const retentionCheck = await db.collection('post_retention').findOne({
+    // Check if retention already recorded (single read)
+    const retentionCheck = await trackedFindOne('post_retention', {
       postId: postId,
       userId: cleanUserId
     }, { projection: { _id: 1 } });
 
     if (retentionCheck) {
-      log('info', `[VIEW-INCREMENT-SKIP] ${cleanUserId} already contributed retention for ${postId}`);
+      log('info', `[VIEW-SKIP] ${cleanUserId} already has retention for ${postId}`);
 
-      const slot = await db.collection('user_slots').findOne(
+      const slot = await trackedFindOne('user_slots',
         { [`${arrayField}.postId`]: postId },
         { projection: { [`${arrayField}.$`]: 1 } }
       );
 
-      const viewCount = slot && slot[arrayField] && slot[arrayField][0]
-        ? Math.max(0, slot[arrayField][0].viewCount || 0)
-        : 0;
+      const viewCount = slot?.[arrayField]?.[0]?.viewCount || 0;
 
       return res.json({
         success: true,
@@ -1442,7 +1390,8 @@ app.post('/api/posts/increment-view', writeLimit, async (req, res) => {
       });
     }
 
-    const updateResult = await db.collection('user_slots').updateOne(
+    // ✅ CRITICAL: Increment view with change detection (single operation)
+    const result = await trackedUpdateOneWithSync('user_slots',
       { [`${arrayField}.postId`]: postId },
       {
         $inc: { [`${arrayField}.$.viewCount`]: 1 },
@@ -1450,30 +1399,17 @@ app.post('/api/posts/increment-view', writeLimit, async (req, res) => {
       }
     );
 
-    if (updateResult.matchedCount === 0) {
-      log('warn', `[VIEW-NOT-FOUND] Post ${postId} not found`);
+    if (!result.value) {
+      log('warn', `[VIEW-NOT-FOUND] ${postId}`);
       return res.status(404).json({ error: 'Post not found' });
     }
 
-    const updatedSlot = await db.collection('user_slots').findOne(
-      { [`${arrayField}.postId`]: postId },
-      { projection: { [`${arrayField}.$`]: 1 } }
-    );
+    const updatedPost = result.value[arrayField]?.find(p => p.postId === postId);
+    const newViewCount = updatedPost?.viewCount || 1;
 
-    const newViewCount = updatedSlot && updatedSlot[arrayField] && updatedSlot[arrayField][0]
-      ? Math.max(0, updatedSlot[arrayField][0].viewCount || 1)
-      : 1;
+    log('info', `[VIEW-SUCCESS] ${cleanUserId} -> ${postId}, count: ${newViewCount}`);
 
-    log('info', `[VIEW-SUCCESS-MANUAL] ${cleanUserId} -> ${postId}, new count: ${newViewCount}`);
-
-    // Track change for batch sync
-    trackChange(postId, {
-      likeCount: updatedSlot?.[arrayField]?.[0]?.likeCount || 0,
-      commentCount: updatedSlot?.[arrayField]?.[0]?.commentCount || 0,
-      viewCount: newViewCount,
-      retention: updatedSlot?.[arrayField]?.[0]?.retention || 0
-    }, isReel);
-
+    // Change already tracked by trackedUpdateOneWithSync
     asyncBroadcast();
 
     return res.json({
@@ -1483,7 +1419,7 @@ app.post('/api/posts/increment-view', writeLimit, async (req, res) => {
     });
 
   } catch (error) {
-    log('error', '[VIEW-INCREMENT-ERROR]', error);
+    log('error', '[VIEW-ERROR]', error);
     return res.status(500).json({ error: 'Failed to increment view count' });
   }
 });
@@ -1697,17 +1633,19 @@ app.post('/api/comments', writeLimit, async (req, res) => {
       replyToUsername: replyToUsername ? validate.sanitize(replyToUsername) : null
     };
 
-    await db.collection('comments').insertOne(comment);
+    await trackedInsertOne('comments', comment);
 
     if (parentId) {
-      await db.collection('comments').updateOne(
+      await trackedUpdateOne('comments',
         { _id: parentId },
         { $inc: { replyCount: 1 } }
       );
     }
 
+    // ✅ CRITICAL: Update user_slots with change detection (single operation)
     const arrayField = isReel ? 'reelsList' : 'postList';
-    await db.collection('user_slots').updateOne(
+    
+    await trackedUpdateOneWithSync('user_slots',
       { [`${arrayField}.postId`]: postId },
       {
         $inc: { [`${arrayField}.$.commentCount`]: 1 },
@@ -1715,22 +1653,9 @@ app.post('/api/comments', writeLimit, async (req, res) => {
       }
     );
 
-    log('info', `[COMMENT-ADDED] ${postId}, syncing to PORT 2000...`);
+    log('info', `[COMMENT-ADDED] ${postId}`);
 
-    // Get updated count and track
-    const updatedSlot = await db.collection('user_slots').findOne(
-      { [`${arrayField}.postId`]: postId },
-      { projection: { [`${arrayField}.$`]: 1 } }
-    );
-
-    const postData = updatedSlot?.[arrayField]?.[0];
-    trackChange(postId, {
-      likeCount: postData?.likeCount || 0,
-      commentCount: postData?.commentCount || 0,
-      viewCount: postData?.viewCount || 0,
-      retention: postData?.retention || 0
-    }, isReel);
-
+    // Change already tracked by trackedUpdateOneWithSync
     asyncBroadcast();
 
     res.json({
@@ -1740,7 +1665,7 @@ app.post('/api/comments', writeLimit, async (req, res) => {
     });
 
   } catch (error) {
-    log('error', 'Add comment error:', error.message);
+    log('error', '[COMMENT-ERROR]', error.message);
     res.status(500).json({ error: 'Internal server error' });
   }
 });
@@ -1790,7 +1715,7 @@ app.delete('/api/comments/:commentId', writeLimit, async (req, res) => {
       return res.status(400).json({ error: 'commentId, userId, and postId required' });
     }
 
-    const comment = await db.collection('comments').findOne({
+    const comment = await trackedFindOne('comments', {
       _id: commentId,
       userId: validate.sanitize(userId)
     });
@@ -1799,11 +1724,12 @@ app.delete('/api/comments/:commentId', writeLimit, async (req, res) => {
       return res.status(404).json({ error: 'Comment not found or unauthorized' });
     }
 
+    // Count replies recursively
     const countReplies = async (parentId) => {
-      const replies = await db.collection('comments')
-        .find({ parentId })
-        .project({ _id: 1 })
-        .toArray();
+      const replies = await trackedFind('comments',
+        { parentId },
+        { projection: { _id: 1 } }
+      );
 
       let count = replies.length;
       for (const reply of replies) {
@@ -1815,7 +1741,7 @@ app.delete('/api/comments/:commentId', writeLimit, async (req, res) => {
     const totalReplies = await countReplies(commentId);
     const totalDeleted = 1 + totalReplies;
 
-    await db.collection('comments').deleteMany({
+    await trackedDeleteOne('comments', {
       $or: [
         { _id: commentId },
         { parentId: commentId }
@@ -1823,14 +1749,16 @@ app.delete('/api/comments/:commentId', writeLimit, async (req, res) => {
     });
 
     if (comment.parentId) {
-      await db.collection('comments').updateOne(
+      await trackedUpdateOne('comments',
         { _id: comment.parentId },
         { $inc: { replyCount: -1 } }
       );
     }
 
+    // ✅ CRITICAL: Update user_slots with change detection (single operation)
     const arrayField = isReel === 'true' ? 'reelsList' : 'postList';
-    await db.collection('user_slots').updateOne(
+    
+    await trackedUpdateOneWithSync('user_slots',
       { [`${arrayField}.postId`]: postId },
       {
         $inc: { [`${arrayField}.$.commentCount`]: -totalDeleted },
@@ -1838,23 +1766,9 @@ app.delete('/api/comments/:commentId', writeLimit, async (req, res) => {
       }
     );
 
-    log('info', `[COMMENT-DELETED] ${postId}, deleted ${totalDeleted}, syncing to PORT 2000...`);
+    log('info', `[COMMENT-DELETED] ${postId}, deleted ${totalDeleted}`);
 
-    // Get updated count and track
-    const isReelBool = isReel === 'true';
-    const updatedSlot = await db.collection('user_slots').findOne(
-      { [`${arrayField}.postId`]: postId },
-      { projection: { [`${arrayField}.$`]: 1 } }
-    );
-
-    const postData = updatedSlot?.[arrayField]?.[0];
-    trackChange(postId, {
-      likeCount: postData?.likeCount || 0,
-      commentCount: postData?.commentCount || 0,
-      viewCount: postData?.viewCount || 0,
-      retention: postData?.retention || 0
-    }, isReelBool);
-
+    // Change already tracked by trackedUpdateOneWithSync
     asyncBroadcast();
 
     res.json({
@@ -1864,7 +1778,7 @@ app.delete('/api/comments/:commentId', writeLimit, async (req, res) => {
     });
 
   } catch (error) {
-    log('error', 'Delete comment error:', error.message);
+    log('error', '[COMMENT-DELETE-ERROR]', error.message);
     res.status(500).json({ error: 'Internal server error' });
   }
 });
@@ -2903,6 +2817,81 @@ async function syncMetricsToPort2000(postId, metrics, isReel) {
     // Silent fail - retention is already saved in PORT 4000
     log('debug', `[RETENTION-SYNC-ERROR] ${postId}: ${error.message}`);
   }
+}
+
+
+
+// ===== REAL-TIME CHANGE DETECTION SYSTEM =====
+// Tracks BEFORE and AFTER state with single read
+async function trackedUpdateOneWithSync(collection, filter, update, options = {}) {
+  const start = performance.now();
+  
+  // Execute update and get BOTH old and new values in ONE operation
+  const result = await db.collection(collection).findOneAndUpdate(
+    filter,
+    update,
+    {
+      ...options,
+      returnDocument: 'after', // Get new document
+      includeResultMetadata: true
+    }
+  );
+  
+  const duration = performance.now() - start;
+  
+  mongoMetrics.trackQuery(
+    `findOneAndUpdate:${collection}`,
+    duration,
+    result.lastErrorObject?.n || 0,
+    result.value ? 1 : 0,
+    filter
+  );
+
+  log('debug', `[MONGO-WRITE] ${collection}.findOneAndUpdate: time=${duration.toFixed(2)}ms`);
+
+  // Auto-detect changes and track for sync
+  if (result.value && collection === 'user_slots') {
+    detectAndTrackChanges(result.value, filter);
+  }
+
+  return result;
+}
+
+// Intelligent change detector - extracts metrics from updated document
+function detectAndTrackChanges(updatedSlot, filter) {
+  if (!updatedSlot) return;
+
+  const { postList = [], reelsList = [] } = updatedSlot;
+
+  // Process posts
+  if (Array.isArray(postList) && postList.length > 0) {
+    postList.forEach(post => {
+      if (post && post.postId) {
+        trackChange(post.postId, {
+          likeCount: post.likeCount || 0,
+          commentCount: post.commentCount || 0,
+          viewCount: post.viewCount || 0,
+          retention: post.retention || 0
+        }, false);
+      }
+    });
+  }
+
+  // Process reels
+  if (Array.isArray(reelsList) && reelsList.length > 0) {
+    reelsList.forEach(reel => {
+      if (reel && reel.postId) {
+        trackChange(reel.postId, {
+          likeCount: reel.likeCount || 0,
+          commentCount: reel.commentCount || 0,
+          viewCount: reel.viewCount || 0,
+          retention: reel.retention || 0
+        }, true);
+      }
+    });
+  }
+
+  log('debug', `[AUTO-DETECT] Tracked ${postList.length} posts + ${reelsList.length} reels from slot ${updatedSlot._id}`);
 }
 
 
