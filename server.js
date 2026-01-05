@@ -24,7 +24,7 @@ const NODE_ENV = process.env.NODE_ENV || 'development';
 const SLOT_CAPACITY = 250;
 const MAX_LIKED_BY_PER_POST = 1000;
 const PORT_2000_URL = process.env.PORT_2000_URL || 'https://samir-hgr9.onrender.com';
-
+const PORT_4000_URL = process.env.PORT_4000_URL || 'https://database-22io.onrender.com';
 
 class SimpleCache {
   constructor(ttlMs = 60000) { // Default 1 minute TTL
@@ -431,8 +431,6 @@ async function trackedCountDocuments(collection, query) {
 
 
 
-
-// Batch executor for syncing to PORT 2000
 async function executeBatchSync() {
   if (pendingSync.size === 0) return;
 
@@ -446,7 +444,10 @@ async function executeBatchSync() {
 
     batch.forEach(([postId, data]) => {
       metricsMap[postId] = {
-        ...data.metrics,
+        likeCount: data.metrics.likeCount || 0,
+        commentCount: data.metrics.commentCount || 0,
+        viewCount: data.metrics.viewCount || 0,
+        retention: data.metrics.retention || 0,
         isReel: data.isReel
       };
     });
@@ -454,7 +455,7 @@ async function executeBatchSync() {
     const controller = new AbortController();
     const timeoutId = setTimeout(() => controller.abort(), 15000);
 
-    const response = await fetch(`${PORT_2000_URL}/api/sync/batch-metrics`, {
+    const response = await fetch(`${PORT_2000_URL}/api/sync/batch-metrics-from-4000`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
@@ -471,7 +472,7 @@ async function executeBatchSync() {
     }
 
     const result = await response.json();
-    log('info', `[BATCH-SYNC-OK] ${result.updated}/${batch.length} synced`);
+    log('info', `[BATCH-SYNC-OK] ${result.updated}/${batch.length} synced to PORT 2000`);
 
   } catch (error) {
     log('error', `[BATCH-SYNC-FAIL] ${error.message}`);
@@ -483,7 +484,6 @@ async function executeBatchSync() {
     setTimeout(executeBatchSync, 5000);
   }
 }
-
 
 
 
@@ -1007,6 +1007,70 @@ app.get('/api/metrics', (req, res) => {
     timestamp: new Date().toISOString()
   });
 });
+
+
+
+// ===== BATCH METRICS SYNC ENDPOINT (called by PORT 2000) =====
+app.post('/api/sync/batch-metrics', async (req, res) => {
+  try {
+    const { metrics, timestamp } = req.body;
+
+    if (!metrics || typeof metrics !== 'object') {
+      return res.status(400).json({ error: 'metrics object required' });
+    }
+
+    log('info', `[BATCH-METRICS-RECEIVED] ${Object.keys(metrics).length} posts from PORT 2000`);
+
+    let updated = 0;
+    let failed = 0;
+
+    for (const [postId, data] of Object.entries(metrics)) {
+      try {
+        const { isReel, likeCount, commentCount, viewCount, retention } = data;
+        const arrayField = isReel ? 'reelsList' : 'postList';
+
+        const result = await trackedUpdateOne('user_slots',
+          { [`${arrayField}.postId`]: postId },
+          {
+            $set: {
+              [`${arrayField}.$.likeCount`]: likeCount || 0,
+              [`${arrayField}.$.commentCount`]: commentCount || 0,
+              [`${arrayField}.$.viewCount`]: viewCount || 0,
+              [`${arrayField}.$.retention`]: retention || 0,
+              [`${arrayField}.$.lastSynced`]: timestamp || new Date().toISOString(),
+              'updatedAt': new Date().toISOString()
+            }
+          }
+        );
+
+        if (result.matchedCount > 0) {
+          updated++;
+        } else {
+          failed++;
+          log('warn', `[BATCH-SYNC-MISS] ${postId} not found in user_slots`);
+        }
+
+      } catch (error) {
+        failed++;
+        log('error', `[BATCH-SYNC-ERROR] ${postId}: ${error.message}`);
+      }
+    }
+
+    log('info', `[BATCH-METRICS-COMPLETE] Updated: ${updated}, Failed: ${failed}`);
+
+    return res.json({
+      success: true,
+      updated,
+      failed,
+      total: Object.keys(metrics).length
+    });
+
+  } catch (error) {
+    log('error', '[BATCH-METRICS-ENDPOINT-ERROR]', error.message);
+    return res.status(500).json({ error: 'Failed to sync metrics' });
+  }
+});
+
 
 // Periodic metrics logging (every 5 minutes)
 setInterval(() => {
