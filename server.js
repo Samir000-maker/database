@@ -1177,13 +1177,22 @@ app.post('/api/posts/record-retention', writeLimit, async (req, res) => {
 
     log('info', `Retention recorded successfully: ${cleanUserId} -> ${postId}, ${retentionPercent}%, viewCount: ${viewCount}`);
 
-    // Track change for batch sync
-    trackChange(postId, {
-      likeCount: updatedSlot?.[arrayField]?.[0]?.likeCount || 0,
-      commentCount: updatedSlot?.[arrayField]?.[0]?.commentCount || 0,
-      viewCount,
-      retention: Math.round(retentionPercent * 100) / 100
-    }, isReel);
+    // ✅ FIXED: Fire-and-forget sync to PORT 2000 (non-blocking)
+const metrics = {
+  likeCount: updatedSlot?.[arrayField]?.[0]?.likeCount || 0,
+  commentCount: updatedSlot?.[arrayField]?.[0]?.commentCount || 0,
+  viewCount,
+  retention: Math.round(retentionPercent * 100) / 100
+};
+
+// Async sync to PORT 2000 (don't block response)
+setImmediate(() => {
+  syncMetricsToPort2000(postId, metrics, isReel).catch(err => {
+    log('warn', `[RETENTION-SYNC-FAILED] ${postId}: ${err.message}`);
+  });
+});
+
+asyncBroadcast();
 
     asyncBroadcast();
 
@@ -2797,6 +2806,42 @@ process.on('unhandledRejection', (reason, promise) => {
   log('error', 'Unhandled Rejection at:', promise, 'reason:', reason);
   gracefulShutdown('unhandledRejection').catch(() => process.exit(1));
 });
+
+
+
+async function syncMetricsToPort2000(postId, metrics, isReel) {
+  const PORT_2000_URL = process.env.PORT_2000_URL || 'https://samir-hgr9.onrender.com';
+  
+  try {
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), 5000); // 5s timeout
+    
+    const response = await fetch(`${PORT_2000_URL}/api/sync/retention-metrics`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        postId,
+        metrics,
+        isReel,
+        timestamp: new Date().toISOString()
+      }),
+      signal: controller.signal
+    });
+    
+    clearTimeout(timeoutId);
+    
+    if (response.ok) {
+      log('debug', `[RETENTION-SYNC-OK] ${postId} synced to PORT 2000`);
+    } else {
+      log('warn', `[RETENTION-SYNC-FAILED] ${postId} - HTTP ${response.status}`);
+    }
+  } catch (error) {
+    // Silent fail - retention is already saved in PORT 4000
+    log('debug', `[RETENTION-SYNC-ERROR] ${postId}: ${error.message}`);
+  }
+}
+
+
 
 async function startServer() {
   try {
