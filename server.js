@@ -134,7 +134,7 @@ class MongoMetrics {
 
 class EnhancedMongoMetrics {
   constructor() {
-    // Read/Write counters
+    // Read/Write counters by collection
     this.readsByCollection = new Map();
     this.writesByCollection = new Map();
     this.totalReads = 0;
@@ -143,10 +143,11 @@ class EnhancedMongoMetrics {
     // Document tracking
     this.docsExaminedByCollection = new Map();
     this.docsReturnedByCollection = new Map();
+    this.documentsReadByCollection = new Map(); // NEW: Track actual document IDs
     
     // Full collection scan tracking
-    this.fullScansDetected = new Set();
-    this.indexedQueries = new Set();
+    this.fullScansDetected = new Map(); // Changed to Map to track query details
+    this.indexedQueries = new Map();
     
     // Performance tracking
     this.queryTimes = [];
@@ -155,30 +156,50 @@ class EnhancedMongoMetrics {
     // Resource tracking
     this.startCpuUsage = process.cpuUsage();
     this.startTime = Date.now();
+    this.startMemory = process.memoryUsage();
   }
 
-  trackOperation(collection, operation, docsExamined, docsReturned, duration, query, executionStats) {
+  trackOperation(collection, operation, docsExamined, docsReturned, duration, query, executionStats, documentIds = []) {
     // Determine if read or write
-    const isRead = ['find', 'findOne', 'count', 'aggregate', 'distinct'].some(op => operation.includes(op));
-    const isWrite = ['insert', 'update', 'delete', 'replace', 'remove'].some(op => operation.includes(op));
+    const isRead = ['find', 'findOne', 'count', 'aggregate', 'distinct', 'countDocuments', 'estimatedDocumentCount'].some(op => operation.toLowerCase().includes(op.toLowerCase()));
+    const isWrite = ['insert', 'update', 'delete', 'replace', 'remove', 'findOneAndUpdate', 'findOneAndReplace', 'findOneAndDelete'].some(op => operation.toLowerCase().includes(op.toLowerCase()));
     
     if (isRead) {
       this.totalReads++;
       this.readsByCollection.set(collection, (this.readsByCollection.get(collection) || 0) + 1);
       
-      // Track documents
+      // Track documents examined and returned
       this.docsExaminedByCollection.set(collection, 
         (this.docsExaminedByCollection.get(collection) || 0) + (docsExamined || 0));
       this.docsReturnedByCollection.set(collection, 
         (this.docsReturnedByCollection.get(collection) || 0) + (docsReturned || 0));
       
-      // Detect full collection scans
+      // Track actual document IDs/names read
+      if (documentIds && documentIds.length > 0) {
+        if (!this.documentsReadByCollection.has(collection)) {
+          this.documentsReadByCollection.set(collection, new Set());
+        }
+        documentIds.forEach(docId => {
+          this.documentsReadByCollection.get(collection).add(String(docId));
+        });
+      }
+      
+      // Detect full collection scans from executionStats
       if (executionStats && executionStats.executionStages) {
-        const stage = executionStats.executionStages.stage || executionStats.executionStages;
-        if (stage === 'COLLSCAN' || (typeof stage === 'string' && stage.includes('COLLSCAN'))) {
-          this.fullScansDetected.add(collection);
-        } else if (stage === 'IXSCAN' || (typeof stage === 'string' && stage.includes('IXSCAN'))) {
-          this.indexedQueries.add(collection);
+        const hasCollScan = this.checkForCollScan(executionStats.executionStages);
+        if (hasCollScan) {
+          if (!this.fullScansDetected.has(collection)) {
+            this.fullScansDetected.set(collection, []);
+          }
+          this.fullScansDetected.get(collection).push({
+            query: JSON.stringify(query).substring(0, 200),
+            timestamp: new Date().toISOString()
+          });
+        } else {
+          if (!this.indexedQueries.has(collection)) {
+            this.indexedQueries.set(collection, 0);
+          }
+          this.indexedQueries.set(collection, this.indexedQueries.get(collection) + 1);
         }
       }
     } else if (isWrite) {
@@ -192,13 +213,33 @@ class EnhancedMongoMetrics {
       this.slowQueries.push({
         operation,
         collection,
-        duration,
+        duration: duration.toFixed(2),
         docsExamined,
         docsReturned,
         query: JSON.stringify(query).substring(0, 200),
         timestamp: new Date().toISOString()
       });
     }
+  }
+
+  checkForCollScan(stage) {
+    if (!stage) return false;
+    
+    // Check current stage
+    if (stage.stage === 'COLLSCAN') return true;
+    
+    // Check nested stages recursively
+    if (stage.inputStage) {
+      return this.checkForCollScan(stage.inputStage);
+    }
+    if (stage.inputStages && Array.isArray(stage.inputStages)) {
+      return stage.inputStages.some(s => this.checkForCollScan(s));
+    }
+    if (stage.shards && Array.isArray(stage.shards)) {
+      return stage.shards.some(s => this.checkForCollScan(s.executionStages));
+    }
+    
+    return false;
   }
 
   logSummary() {
@@ -215,18 +256,35 @@ class EnhancedMongoMetrics {
         const examined = this.docsExaminedByCollection.get(collection) || 0;
         const returned = this.docsReturnedByCollection.get(collection) || 0;
         console.log(`Collection "${collection}": ${count} read operations, ${examined} documents examined, ${returned} documents returned`);
+        
+        // Show actual documents read
+        if (this.documentsReadByCollection.has(collection)) {
+          const docIds = Array.from(this.documentsReadByCollection.get(collection));
+          if (docIds.length > 0) {
+            const displayIds = docIds.slice(0, 10); // Show first 10
+            const remaining = docIds.length - displayIds.length;
+            console.log(`  Documents read: ${displayIds.join(', ')}${remaining > 0 ? ` (and ${remaining} more)` : ''}`);
+          }
+        }
       });
     } else {
       console.log('No read operations performed');
     }
     
     // Full collection scan detection
-    if (this.fullScansDetected.size > 0) {
-      console.log(`\nFull collection scan happens to [${Array.from(this.fullScansDetected).join(', ')}]`);
+    const collectionsWithScans = Array.from(this.fullScansDetected.keys());
+    const collectionsWithIndexes = Array.from(this.indexedQueries.keys());
+    
+    if (collectionsWithScans.length > 0) {
+      console.log(`\nFull collection scan happens to [${collectionsWithScans.join(', ')}]`);
+      collectionsWithScans.forEach(col => {
+        const scans = this.fullScansDetected.get(col);
+        console.log(`  "${col}" had ${scans.length} full collection scan(s)`);
+      });
     } else {
-      const collections = Array.from(this.readsByCollection.keys());
-      if (collections.length > 0) {
-        console.log(`\nNo full collection scan to [${collections.join(', ')}]`);
+      const allReadCollections = Array.from(this.readsByCollection.keys());
+      if (allReadCollections.length > 0) {
+        console.log(`\nNo full collection scan to [${allReadCollections.join(', ')}]`);
       }
     }
     
@@ -251,6 +309,10 @@ class EnhancedMongoMetrics {
     console.log(`MongoDB CPU usage: ${cpuPercent.toFixed(2)}% (user: ${(cpuUsage.user / 1000).toFixed(2)}ms, system: ${(cpuUsage.system / 1000).toFixed(2)}ms)`);
     console.log(`MongoDB RAM usage: ${(memUsage.heapUsed / 1024 / 1024).toFixed(2)} MB (Heap), ${(memUsage.rss / 1024 / 1024).toFixed(2)} MB (RSS)`);
     
+    // Memory delta
+    const memoryDelta = memUsage.heapUsed - this.startMemory.heapUsed;
+    console.log(`Memory change since start: ${(memoryDelta / 1024 / 1024).toFixed(2)} MB`);
+    
     // System pressure assessment
     const avgQueryTime = this.queryTimes.length > 0 
       ? this.queryTimes.reduce((a, b) => a + b, 0) / this.queryTimes.length 
@@ -259,7 +321,7 @@ class EnhancedMongoMetrics {
     let pressureStatus = 'Normal';
     if (avgQueryTime > 100 || this.slowQueries.length > 10) {
       pressureStatus = 'High - Many slow queries detected';
-    } else if (this.fullScansDetected.size > 0) {
+    } else if (collectionsWithScans.length > 0) {
       pressureStatus = 'Moderate - Full collection scans detected';
     } else if (avgQueryTime > 50) {
       pressureStatus = 'Moderate - Average query time elevated';
@@ -269,6 +331,13 @@ class EnhancedMongoMetrics {
     console.log(`Average query time: ${avgQueryTime.toFixed(2)}ms`);
     console.log(`Slow queries (>100ms): ${this.slowQueries.length}`);
     
+    if (this.slowQueries.length > 0) {
+      console.log('\nSlowest queries:');
+      this.slowQueries.slice(0, 5).forEach(q => {
+        console.log(`  ${q.operation} on "${q.collection}" - ${q.duration}ms`);
+      });
+    }
+    
     console.log('\n=====================================================================\n');
   }
 
@@ -277,6 +346,7 @@ class EnhancedMongoMetrics {
     this.writesByCollection.clear();
     this.docsExaminedByCollection.clear();
     this.docsReturnedByCollection.clear();
+    this.documentsReadByCollection.clear();
     this.fullScansDetected.clear();
     this.indexedQueries.clear();
     this.totalReads = 0;
@@ -285,34 +355,66 @@ class EnhancedMongoMetrics {
     this.slowQueries = [];
     this.startCpuUsage = process.cpuUsage();
     this.startTime = Date.now();
+    this.startMemory = process.memoryUsage();
   }
 }
+
+// Replace the old mongoMetrics initialization
+const enhancedMongoMetrics = new EnhancedMongoMetrics();
 
 class ServerMetrics {
   constructor() {
     this.totalRequests = 0;
     this.getRequests = 0;
     this.postRequests = 0;
+    this.putRequests = 0;
+    this.deleteRequests = 0;
+    this.patchRequests = 0;
+    this.optionsRequests = 0;
     this.endpointCounts = new Map();
     this.activeRequests = 0;
     this.responseTimes = [];
     this.startCpuUsage = process.cpuUsage();
     this.startTime = Date.now();
+    this.startMemory = process.memoryUsage();
+    this.requestsByStatusCode = new Map();
   }
 
   trackRequest(method, endpoint) {
     this.totalRequests++;
     this.activeRequests++;
     
-    if (method === 'GET') this.getRequests++;
-    else if (method === 'POST') this.postRequests++;
+    // Track by method
+    switch (method.toUpperCase()) {
+      case 'GET': this.getRequests++; break;
+      case 'POST': this.postRequests++; break;
+      case 'PUT': this.putRequests++; break;
+      case 'DELETE': this.deleteRequests++; break;
+      case 'PATCH': this.patchRequests++; break;
+      case 'OPTIONS': this.optionsRequests++; break;
+    }
     
-    this.endpointCounts.set(endpoint, (this.endpointCounts.get(endpoint) || 0) + 1);
+    // Track by endpoint
+    const endpointKey = `${method} ${endpoint}`;
+    if (!this.endpointCounts.has(endpointKey)) {
+      this.endpointCounts.set(endpointKey, { count: 0, totalTime: 0 });
+    }
+    const endpointData = this.endpointCounts.get(endpointKey);
+    endpointData.count++;
   }
 
-  trackResponse(duration) {
-    this.activeRequests--;
+  trackResponse(duration, statusCode, endpoint, method) {
+    this.activeRequests = Math.max(0, this.activeRequests - 1);
     this.responseTimes.push(duration);
+    
+    // Track status codes
+    this.requestsByStatusCode.set(statusCode, (this.requestsByStatusCode.get(statusCode) || 0) + 1);
+    
+    // Track endpoint timing
+    const endpointKey = `${method} ${endpoint}`;
+    if (this.endpointCounts.has(endpointKey)) {
+      this.endpointCounts.get(endpointKey).totalTime += duration;
+    }
   }
 
   logSummary() {
@@ -327,15 +429,31 @@ class ServerMetrics {
     console.log(`Total requests: ${this.totalRequests}`);
     console.log(`GET requests: ${this.getRequests}`);
     console.log(`POST requests: ${this.postRequests}`);
+    if (this.putRequests > 0) console.log(`PUT requests: ${this.putRequests}`);
+    if (this.deleteRequests > 0) console.log(`DELETE requests: ${this.deleteRequests}`);
+    if (this.patchRequests > 0) console.log(`PATCH requests: ${this.patchRequests}`);
+    if (this.optionsRequests > 0) console.log(`OPTIONS requests: ${this.optionsRequests}`);
     console.log(`Active requests: ${this.activeRequests}`);
+    
+    // Status codes
+    if (this.requestsByStatusCode.size > 0) {
+      console.log('\n--- RESPONSE STATUS CODES ---');
+      const sortedStatusCodes = Array.from(this.requestsByStatusCode.entries())
+        .sort((a, b) => b[1] - a[1]);
+      sortedStatusCodes.forEach(([code, count]) => {
+        console.log(`${code}: ${count} requests`);
+      });
+    }
     
     // Endpoints
     console.log('\n--- ENDPOINT BREAKDOWN ---');
     const sortedEndpoints = Array.from(this.endpointCounts.entries())
-      .sort((a, b) => b[1] - a[1]);
+      .sort((a, b) => b[1].count - a[1].count)
+      .slice(0, 20); // Top 20 endpoints
     
-    sortedEndpoints.forEach(([endpoint, count]) => {
-      console.log(`${endpoint}: ${count} requests`);
+    sortedEndpoints.forEach(([endpoint, data]) => {
+      const avgTime = data.count > 0 ? (data.totalTime / data.count).toFixed(2) : '0.00';
+      console.log(`${endpoint}: ${data.count} requests (avg ${avgTime}ms)`);
     });
     
     // Server resource usage
@@ -347,9 +465,21 @@ class ServerMetrics {
     console.log(`RSS (Resident Set Size): ${(memUsage.rss / 1024 / 1024).toFixed(2)} MB`);
     console.log(`External memory: ${(memUsage.external / 1024 / 1024).toFixed(2)} MB`);
     
+    // Memory delta
+    const memoryDelta = memUsage.heapUsed - this.startMemory.heapUsed;
+    console.log(`Memory change since start: ${(memoryDelta / 1024 / 1024).toFixed(2)} MB`);
+    
     // Server load assessment
     const avgResponseTime = this.responseTimes.length > 0
       ? this.responseTimes.reduce((a, b) => a + b, 0) / this.responseTimes.length
+      : 0;
+    
+    const maxResponseTime = this.responseTimes.length > 0
+      ? Math.max(...this.responseTimes)
+      : 0;
+    
+    const minResponseTime = this.responseTimes.length > 0
+      ? Math.min(...this.responseTimes)
       : 0;
     
     let loadStatus = 'Normal';
@@ -361,7 +491,10 @@ class ServerMetrics {
     
     console.log(`\nServer load and pressure: ${loadStatus}`);
     console.log(`Average response time: ${avgResponseTime.toFixed(2)}ms`);
+    console.log(`Min response time: ${minResponseTime.toFixed(2)}ms`);
+    console.log(`Max response time: ${maxResponseTime.toFixed(2)}ms`);
     console.log(`Server uptime: ${(duration / 1000).toFixed(2)} seconds`);
+    console.log(`Requests per second: ${(this.totalRequests / (duration / 1000)).toFixed(2)}`);
     
     console.log('\n================================================================\n');
   }
@@ -370,11 +503,17 @@ class ServerMetrics {
     this.totalRequests = 0;
     this.getRequests = 0;
     this.postRequests = 0;
+    this.putRequests = 0;
+    this.deleteRequests = 0;
+    this.patchRequests = 0;
+    this.optionsRequests = 0;
     this.endpointCounts.clear();
     this.activeRequests = 0;
     this.responseTimes = [];
+    this.requestsByStatusCode.clear();
     this.startCpuUsage = process.cpuUsage();
     this.startTime = Date.now();
+    this.startMemory = process.memoryUsage();
   }
 }
 
@@ -486,12 +625,26 @@ app.use((req, res, next) => {
   // Track request start
   serverMetrics.trackRequest(method, endpoint);
 
-  res.on('finish', () => {
-    const duration = performance.now() - start;
-    serverMetrics.trackResponse(duration);
+  // Store original end function
+  const originalEnd = res.end;
+  
+  // Override res.end to capture completion
+  res.end = function(...args) {
+    // Restore original end
+    res.end = originalEnd;
     
+    // Calculate duration
+    const duration = performance.now() - start;
+    
+    // Track response
+    serverMetrics.trackResponse(duration, res.statusCode, endpoint, method);
+    
+    // Log to console
     log('debug', `[samir_server_debug] ${method} ${endpoint} - ${res.statusCode} - ${duration.toFixed(2)}ms`);
-  });
+    
+    // Call original end
+    return res.end.apply(res, args);
+  };
 
   next();
 });
@@ -553,7 +706,7 @@ function logPeriodicSummaries() {
     // serverMetrics.reset();
     // enhancedMongoMetrics.reset();
     
-  }, 5 * 60 * 1000); // Every 5 minutes
+  }, 10 * 1000); // Every 5 minutes
 }
 
 
@@ -561,36 +714,231 @@ function logPeriodicSummaries() {
 
 async function trackedFind(collection, query, options = {}) {
   const start = performance.now();
-  const cursor = db.collection(collection).find(query, options);
-  const results = await cursor.toArray();
   
-  // Get explain data for accurate tracking
-  let executionStats = null;
   try {
-    const explain = await db.collection(collection)
+    // Execute query with explain to get execution stats
+    const explainResult = await db.collection(collection)
       .find(query, options)
       .explain('executionStats');
-    executionStats = explain.executionStats;
+    
+    // Now execute the actual query
+    const cursor = db.collection(collection).find(query, options);
+    const results = await cursor.toArray();
     
     const duration = performance.now() - start;
+    const executionStats = explainResult.executionStats;
+    
+    // Extract document IDs from results
+    const documentIds = results.map(doc => doc._id || doc.postId || doc.userId || doc.id || 'unknown').filter(Boolean);
     
     enhancedMongoMetrics.trackOperation(
       collection,
       'find',
-      executionStats.totalDocsExamined,
-      executionStats.nReturned,
+      executionStats.totalDocsExamined || 0,
+      executionStats.nReturned || results.length,
       duration,
       query,
-      executionStats
+      executionStats,
+      documentIds
     );
     
-    log('debug', `[samir_mongo_debug] ${collection}.find: examined=${executionStats.totalDocsExamined}, returned=${executionStats.nReturned}, time=${duration.toFixed(2)}ms, stage=${executionStats.executionStages?.stage}`);
-  } catch (explainError) {
+    log('debug', `[samir_mongo_debug] ${collection}.find: examined=${executionStats.totalDocsExamined || 0}, returned=${results.length}, time=${duration.toFixed(2)}ms, stage=${executionStats.executionStages?.stage || 'unknown'}`);
+    
+    return results;
+  } catch (error) {
     const duration = performance.now() - start;
-    log('debug', `[samir_mongo_debug] ${collection}.find: returned=${results.length}, time=${duration.toFixed(2)}ms`);
+    log('error', `[samir_mongo_debug] ${collection}.find failed: ${error.message}, time=${duration.toFixed(2)}ms`);
+    throw error;
   }
+}
 
-  return results;
+async function trackedFindOne(collection, query, options = {}) {
+  const start = performance.now();
+  
+  try {
+    const result = await db.collection(collection).findOne(query, options);
+    const duration = performance.now() - start;
+    
+    // Extract document ID
+    const documentId = result ? (result._id || result.postId || result.userId || result.id || 'unknown') : null;
+    
+    enhancedMongoMetrics.trackOperation(
+      collection,
+      'findOne',
+      result ? 1 : 0,
+      result ? 1 : 0,
+      duration,
+      query,
+      null,
+      documentId ? [documentId] : []
+    );
+
+    log('debug', `[samir_mongo_debug] ${collection}.findOne: time=${duration.toFixed(2)}ms, found=${!!result}${result ? `, document=${documentId}` : ''}`);
+
+    return result;
+  } catch (error) {
+    const duration = performance.now() - start;
+    log('error', `[samir_mongo_debug] ${collection}.findOne failed: ${error.message}, time=${duration.toFixed(2)}ms`);
+    throw error;
+  }
+}
+
+async function trackedUpdateOne(collection, filter, update, options = {}) {
+  const start = performance.now();
+  
+  try {
+    const result = await db.collection(collection).updateOne(filter, update, options);
+    const duration = performance.now() - start;
+    
+    enhancedMongoMetrics.trackOperation(
+      collection,
+      'updateOne',
+      result.matchedCount,
+      result.modifiedCount,
+      duration,
+      filter,
+      null
+    );
+
+    log('debug', `[samir_mongo_debug] ${collection}.updateOne: matched=${result.matchedCount}, modified=${result.modifiedCount}, time=${duration.toFixed(2)}ms`);
+
+    return result;
+  } catch (error) {
+    const duration = performance.now() - start;
+    log('error', `[samir_mongo_debug] ${collection}.updateOne failed: ${error.message}, time=${duration.toFixed(2)}ms`);
+    throw error;
+  }
+}
+
+async function trackedInsertOne(collection, document) {
+  const start = performance.now();
+  
+  try {
+    const result = await db.collection(collection).insertOne(document);
+    const duration = performance.now() - start;
+    
+    const documentId = result.insertedId || document._id || 'unknown';
+    
+    enhancedMongoMetrics.trackOperation(
+      collection,
+      'insertOne',
+      0,
+      1,
+      duration,
+      {},
+      null,
+      [documentId]
+    );
+
+    log('debug', `[samir_mongo_debug] ${collection}.insertOne: document=${documentId}, time=${duration.toFixed(2)}ms`);
+
+    return result;
+  } catch (error) {
+    const duration = performance.now() - start;
+    log('error', `[samir_mongo_debug] ${collection}.insertOne failed: ${error.message}, time=${duration.toFixed(2)}ms`);
+    throw error;
+  }
+}
+
+async function trackedDeleteOne(collection, filter) {
+  const start = performance.now();
+  
+  try {
+    const result = await db.collection(collection).deleteOne(filter);
+    const duration = performance.now() - start;
+    
+    enhancedMongoMetrics.trackOperation(
+      collection,
+      'deleteOne',
+      result.deletedCount,
+      result.deletedCount,
+      duration,
+      filter,
+      null
+    );
+
+    log('debug', `[samir_mongo_debug] ${collection}.deleteOne: deleted=${result.deletedCount}, time=${duration.toFixed(2)}ms`);
+
+    return result;
+  } catch (error) {
+    const duration = performance.now() - start;
+    log('error', `[samir_mongo_debug] ${collection}.deleteOne failed: ${error.message}, time=${duration.toFixed(2)}ms`);
+    throw error;
+  }
+}
+
+async function trackedCountDocuments(collection, query) {
+  const start = performance.now();
+  
+  try {
+    const count = Object.keys(query).length === 0
+      ? await db.collection(collection).estimatedDocumentCount()
+      : await db.collection(collection).countDocuments(query);
+      
+    const duration = performance.now() - start;
+    
+    enhancedMongoMetrics.trackOperation(
+      collection,
+      'countDocuments',
+      count,
+      1,
+      duration,
+      query,
+      null
+    );
+
+    log('debug', `[samir_mongo_debug] ${collection}.countDocuments: result=${count}, time=${duration.toFixed(2)}ms`);
+
+    return count;
+  } catch (error) {
+    const duration = performance.now() - start;
+    log('error', `[samir_mongo_debug] ${collection}.countDocuments failed: ${error.message}, time=${duration.toFixed(2)}ms`);
+    throw error;
+  }
+}
+
+async function trackedUpdateOneWithSync(collection, filter, update, options = {}) {
+  const start = performance.now();
+  
+  try {
+    const result = await db.collection(collection).findOneAndUpdate(
+      filter,
+      update,
+      {
+        ...options,
+        returnDocument: 'after',
+        includeResultMetadata: true
+      }
+    );
+    
+    const duration = performance.now() - start;
+    
+    const documentId = result.value ? (result.value._id || result.value.postId || result.value.userId || 'unknown') : null;
+    
+    enhancedMongoMetrics.trackOperation(
+      collection,
+      'findOneAndUpdate',
+      result.lastErrorObject?.n || 0,
+      result.value ? 1 : 0,
+      duration,
+      filter,
+      null,
+      documentId ? [documentId] : []
+    );
+
+    log('debug', `[samir_mongo_debug] ${collection}.findOneAndUpdate: time=${duration.toFixed(2)}ms${documentId ? `, document=${documentId}` : ''}`);
+
+    // Auto-detect changes and track for sync
+    if (result.value && collection === 'user_slots') {
+      detectAndTrackChanges(result.value, filter);
+    }
+
+    return result;
+  } catch (error) {
+    const duration = performance.now() - start;
+    log('error', `[samir_mongo_debug] ${collection}.findOneAndUpdate failed: ${error.message}, time=${duration.toFixed(2)}ms`);
+    throw error;
+  }
 }
 
 async function trackedFindOne(collection, query, options = {}) {
@@ -1022,35 +1370,6 @@ async function setupCriticalIndexes() {
 }
 
 
-
-
-async function initMongo() {
-  try {
-    client = new MongoClient(MONGODB_URI, {
-      maxPoolSize: 10,
-      serverSelectionTimeoutMS: 5000,
-      socketTimeoutMS: 45000,
-      family: 4,
-      retryWrites: true,
-      w: 'majority'
-    });
-
-    await client.connect();
-    db = client.db(DB_NAME);
-    await db.admin().ping();
-    log('info', 'MongoDB connection established successfully');
-
-    // Existing index creation
-    await setupCriticalIndexes();
-    
-    // ✅ ADD THIS: Following feed indexes
-    await createFollowingFeedIndexes();
-
-  } catch (error) {
-    log('error', 'MongoDB initialization failed:', error && error.message ? error.message : error);
-    throw error;
-  }
-}
 
 
 async function initMongo() {
