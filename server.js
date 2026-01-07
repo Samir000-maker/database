@@ -359,9 +359,6 @@ class EnhancedMongoMetrics {
   }
 }
 
-// Replace the old mongoMetrics initialization
-const enhancedMongoMetrics = new EnhancedMongoMetrics();
-
 class ServerMetrics {
   constructor() {
     this.totalRequests = 0;
